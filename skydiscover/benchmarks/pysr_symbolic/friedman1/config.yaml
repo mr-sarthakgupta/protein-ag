@@ -1,0 +1,75 @@
+# PySR symbolic benchmark: Friedman #1
+# Usage: skydiscover-run initial_program.py evaluator.py -c config.yaml -s adaevolve|evox
+
+language: python
+diff_based_generation: true
+max_iterations: 50
+checkpoint_interval: 5
+max_solution_length: 60000
+random_seed: 42
+
+llm:
+  models:
+    - name: "gpt-5-mini"
+      weight: 1.0
+  api_base: "https://api.openai.com/v1"
+  temperature: 0.7
+  max_tokens: 16000
+  timeout: 600
+
+prompt:
+  system_message: |
+    You are an expert in symbolic regression and equation discovery.
+
+    This benchmark uses SkyDiscover's EvoX / AdaEvolve as the actual evolutionary
+    algorithms. Each candidate program is an individual in that search. Your task is
+    to improve the Python function `discover(X_train, y_train, X_val, y_val)` in the
+    EVOLVE-BLOCK so that it constructs a better symbolic equation candidate.
+
+    PySR is only a component library here. Use it through `pysr_harness` for useful
+    symbolic-regression building blocks such as PySR-compatible feature symbols,
+    tunable constants, expression export/evaluation, simplification, and fitting the
+    continuous constants inside a proposed equation.
+
+    Do **not** make PySR the algorithm:
+    - Do not call `PySRRegressor.fit`.
+    - Do not call `run_gp_session`.
+    - Do not run PySR / SymbolicRegression.jl's `equation_search`.
+    - Do not optimize PySR hyperparameters, operator weights, population sizes, or
+      mutation probabilities as the main task.
+
+    Use `pysr_harness.equation_session` helpers:
+    - `feature_symbols(n)` creates PySR-compatible variables `x0`, `x1`, ...
+    - `constant_symbols(n)` creates tunable constants `c0`, `c1`, ...
+    - `pysr_operator_names()` lists the available PySR unary, binary, and ternary
+      operator names.
+    - `pysr_operator_namespace()` returns PySR-to-SymPy callables for named
+      operators such as `sin`, `cos`, `sqrt`, `log1p`, `max`, `min`, `muladd`,
+      and `clamp`.
+    - `evaluate_expression(expr, X_train, y_train, X_val, y_val, constants=...)`
+      fits constants in the proposed equation, simplifies/exports it, and returns
+      evaluator metrics.
+
+    Improve the equation-discovery candidate inside `discover()`:
+    - Build an explicit symbolic expression or expression template.
+    - Combine features with PySR/SymPy-compatible operators such as `+`, `-`, `*`,
+      `/`, `sin`, `cos`, `exp`, `log`, `sqrt`, powers, and low-complexity
+      compositions.
+    - Use tunable constants for scales, offsets, exponents, and interaction weights.
+    - Keep expressions numerically stable, reasonably simple, and general; do not
+      hardcode target values, validation rows, or Friedman-specific constants.
+
+    The evaluator scores validation NMSE; higher `combined_score` is better
+    (1 / (1 + nmse_val)). Keep runtime reasonable — the evaluator enforces a timeout.
+
+evaluator:
+  timeout: 600
+  cascade_evaluation: true
+  cascade_thresholds:
+    - 0.2
+    - 0.5
+
+monitor:
+  enabled: true
+  port: 8765
+  host: "127.0.0.1"

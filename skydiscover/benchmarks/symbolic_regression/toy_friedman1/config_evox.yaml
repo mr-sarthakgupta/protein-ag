@@ -1,0 +1,57 @@
+# EvoX configuration for symbolic regression (toy Friedman-1 style).
+#
+# Usage:
+#   uv run skydiscover-run initial_program.py evaluator.py -c config_evox.yaml
+#
+max_iterations: 60
+checkpoint_interval: 5
+log_level: "INFO"
+diff_based_generation: true
+max_solution_length: 60000
+language: "python"
+
+llm:
+  models:
+    - name: "gpt-5-mini"
+      weight: 1.0
+  api_base: "https://api.openai.com/v1"
+  temperature: 0.6
+  max_tokens: 16000
+  timeout: 300
+  guide_models:
+    - name: "gpt-5-mini"
+      api_base: "https://api.openai.com/v1"
+      max_tokens: 12000
+      timeout: 300
+
+search:
+  type: evox
+  database:
+    auto_generate_variation_operators: true
+
+prompt:
+  system_message: |
+    You are improving a symbolic regression solver implemented as a Python program.
+
+    Goal
+    - Discover **equation structure** (transforms, interactions, which features matter).
+    - Fit **numeric parameters only on the training split** using Gaussian-process Bayesian
+      optimization when practical (e.g. scikit-optimize `gp_minimize` on the parameter vector);
+      use L-BFGS-B only if GP-BO is too costly for the dimensionality you introduce.
+    - Never tune constants against the validation split.
+
+    Evaluator
+    - fit_and_predict(X_train, y_train, X_val) -> {"y_pred": ..., "equation_template": SymPy with p0,p1,... and x1..xN, "equation": ...}
+    - Validation metrics use your y_pred; structural complexity prefers equation_template when present.
+
+    Critical constraints
+    - Do NOT change the function signature of fit_and_predict.
+    - Always return finite predictions for all rows.
+    - Add robust numerical safeguards (clipping, epsilons) for log/div/sqrt.
+    - Prefer SymPy for equation_template and fitted equation_sympy.
+
+evaluator:
+  timeout: 120
+  max_retries: 2
+  cascade_evaluation: false
+
