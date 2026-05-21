@@ -1,5 +1,5 @@
 # EVOLVE-BLOCK-START
-"""Symbolic regression seed where SkyDiscover evolves the equation template."""
+"""Symbolic regression seed for Alpha-synuclein Gaspar 2017 0.3uM seed data."""
 
 from __future__ import annotations
 
@@ -24,16 +24,20 @@ def evaluate_symbolic_candidate(
     """
     Propose an equation structure and let the harness fit its constants.
 
-    EvoX / AdaEvolve should improve the expression template below. PySR is used
-    for expression export/evaluation conveniences while SkyDiscover remains the
-    evolutionary algorithm producing candidate equations.
+    Features are x0 = elapsed measurement coordinate X and x1 = concentration_uM.
+    EvoX / AdaEvolve should improve this expression template while the harness
+    fits continuous constants and scores validation NMSE.
     """
     x = feature_symbols(X_train.shape[1])
-    c = constant_symbols(X_train.shape[1] + 1)
+    c = constant_symbols(8)
 
-    # Conservative seed: an affine equation. The evolved program should replace
-    # this with richer symbolic structure using PySR-compatible operators.
-    expression = c[-1] + sum(c[i] * x[i] for i in range(X_train.shape[1]))
+    time = x[0]
+    concentration = x[1]
+
+    initial_level = c[0] / (concentration + c[1])
+    plateau = c[2]
+    rate = c[3] ** 2 + c[4] ** 2 * concentration + c[5] ** 2 / (concentration + c[6] ** 2)
+    expression = plateau - (plateau - initial_level) * sp.exp(-rate * time) + c[7]
 
     return evaluate_expression(
         sp.simplify(expression),
@@ -59,17 +63,10 @@ def run_discovery(
 
 
 def _load_data():
-    """Load deterministic Friedman #1 splits (matches evaluator)."""
-    from sklearn.datasets import make_friedman1
-    from sklearn.model_selection import train_test_split
+    """Load deterministic Alpha-synuclein Gaspar 2017 splits (matches evaluator)."""
+    from evaluator import load_alphasyn_data
 
-    X, y = make_friedman1(
-        n_samples=400,
-        n_features=5,
-        noise=0.1,
-        random_state=42,
-    )
-    return train_test_split(X, y, test_size=0.25, random_state=42)
+    return load_alphasyn_data()
 
 
 if __name__ == "__main__":

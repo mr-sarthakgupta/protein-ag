@@ -82,7 +82,11 @@ def parse_args() -> argparse.Namespace:
         "--model",
         "-m",
         default=None,
-        help="LLM model(s) for solution generation, comma-separated (e.g. 'gpt-5', 'gpt-5,gemini/gemini-3-pro')",
+        help=(
+            "LLM model(s) for solution generation, comma-separated "
+            "(e.g. 'gpt-5', 'gpt-5,gemini/gemini-3-pro', "
+            "'bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0')"
+        ),
     )
     parser.add_argument(
         "--search",

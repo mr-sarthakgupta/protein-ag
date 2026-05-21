@@ -63,6 +63,81 @@ class TestApiBaseRouting:
         assert cfg.models[0].api_base == "https://api.anthropic.com/v1/"
         assert cfg.models[1].api_base == "http://localhost:11434/v1"
 
+    def test_bedrock_model_uses_native_provider(self):
+        cfg = LLMConfig(
+            models=[
+                LLMModelConfig(
+                    name="bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+                )
+            ],
+        )
+        assert cfg.models[0].name == "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        assert cfg.models[0].api_base == "bedrock"
+
+    def test_bedrock_model_preserves_region_override(self):
+        cfg = LLMConfig(
+            api_base="bedrock:us-west-2",
+            models=[
+                LLMModelConfig(
+                    name="bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+                )
+            ],
+        )
+        assert cfg.models[0].api_base == "bedrock:us-west-2"
+
+    def test_bedrock_does_not_fall_back_to_openai_key(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        cfg = LLMConfig(
+            models=[
+                LLMModelConfig(
+                    name="bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+                )
+            ],
+        )
+        assert cfg.models[0].api_key is None
+
+
+class TestBedrockLLMParams:
+    def _make_llm(self, temperature=0.7, top_p=0.95):
+        from skydiscover.llm.bedrock import BedrockLLM
+
+        llm = BedrockLLM.__new__(BedrockLLM)
+        llm.model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        llm.temperature = temperature
+        llm.top_p = top_p
+        llm.max_tokens = 1024
+        llm.timeout = 10
+        llm.retries = 0
+        llm.retry_delay = 0
+        llm.api_base = "bedrock"
+        return llm
+
+    def test_builds_converse_params(self):
+        llm = self._make_llm(temperature=0.5, top_p=0.9)
+        params = llm._build_converse_params(
+            "sys",
+            [{"role": "user", "content": "hello"}],
+            max_tokens=512,
+        )
+        assert params["modelId"] == "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        assert params["system"] == [{"text": "sys"}]
+        assert params["messages"] == [{"role": "user", "content": [{"text": "hello"}]}]
+        assert params["inferenceConfig"] == {
+            "maxTokens": 512,
+            "temperature": 0.5,
+            "topP": 0.9,
+        }
+
+    def test_excludes_none_sampling_params(self):
+        llm = self._make_llm(temperature=None, top_p=None)
+        params = llm._build_converse_params(
+            "sys",
+            [{"role": "user", "content": "hello"}],
+        )
+        assert params["inferenceConfig"] == {"maxTokens": 1024}
+
 
 class TestOpenAILLMParams:
     def _make_llm(self, temperature=0.7, top_p=0.95):

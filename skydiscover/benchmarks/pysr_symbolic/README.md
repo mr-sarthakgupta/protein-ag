@@ -4,13 +4,13 @@ Evolve **symbolic equation-discovery code** with SkyDiscover (EvoX / AdaEvolve),
 
 ## Design
 
-- **Evolution algorithm (SkyDiscover):** AdaEvolve or EvoX evolves Python programs via LLM edits (`discover()` in `initial_program.py`).
-- **Candidate artifact:** `discover()` builds a symbolic expression template with feature symbols and tunable constants.
+- **Evolution algorithm (SkyDiscover):** AdaEvolve or EvoX evolves Python programs via LLM edits (`evaluate_symbolic_candidate()` in `initial_program.py`).
+- **Candidate artifact:** `evaluate_symbolic_candidate()` builds a symbolic expression template with feature symbols and tunable constants.
 - **PySR-backed utilities:** `pysr_harness` fits constants, simplifies/exports expressions, evaluates predictions, and scores validation NMSE.
 - **Evaluator:** Runs the harness on a dataset (Friedman #1 is the first example task) and returns `combined_score = 1 / (1 + nmse_val)`.
 
 ```
-skydiscover-run → LLM edits discover() → fit/evaluate proposed equation → combined_score
+skydiscover-run → LLM edits evaluate_symbolic_candidate() → fit/evaluate proposed equation → combined_score
 ```
 
 ## Setup
@@ -41,11 +41,18 @@ For local development, `requirements.txt` installs PySR from `../../../pysr` (ed
 | Task | Description |
 |------|-------------|
 | [`friedman1/`](friedman1/) | sklearn Friedman #1 (5 features, sin interaction + polynomial terms) |
+| [`alphasyn_gaspar2017_03um_seed_all/`](alphasyn_gaspar2017_03um_seed_all/) | Alpha-synuclein Gaspar 2017 0.3uM seed rescaled response curves from copied `fit.tsv` |
 
 ## Run
 
 ```bash
+# OpenAI-compatible default
 export OPENAI_API_KEY="..."
+
+# Or AWS Bedrock
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-east-1"
 
 # AdaEvolve (or use -s evox)
 uv run skydiscover-run \
@@ -101,7 +108,7 @@ Friedman #1 is only an **example benchmark task** — defaults are not tuned to 
 
 ## What the LLM should evolve
 
-Inside `discover()`:
+Inside `evaluate_symbolic_candidate()`:
 
 - The symbolic expression template
 - Which features appear
