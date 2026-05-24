@@ -78,10 +78,11 @@ def _complexity(expression: sp.Expr) -> float:
 def _predict(expression: sp.Expr, X: NDArray, feature_names: Sequence[str]) -> NDArray:
     symbols = create_sympy_symbols(feature_names)
     fn = sympy2numpy(expression, symbols)
-    if isinstance(fn, CallableEquation):
-        y_pred = fn(np.asarray(X, dtype=float))
-    else:
-        y_pred = fn(*[X[:, i] for i in range(X.shape[1])])
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        if isinstance(fn, CallableEquation):
+            y_pred = fn(np.asarray(X, dtype=float))
+        else:
+            y_pred = fn(*[X[:, i] for i in range(X.shape[1])])
     return np.asarray(y_pred, dtype=float).reshape(-1)
 
 
@@ -140,12 +141,16 @@ def fit_expression_constants(
             return np.full_like(y_train, 1e12, dtype=float)
         return prediction - y_train
 
-    result = least_squares(
-        residual,
-        x0,
-        loss="soft_l1",
-        max_nfev=max_nfev,
-    )
+    import warnings
+
+    with warnings.catch_warnings(), np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
+        result = least_squares(
+            residual,
+            x0,
+            loss="soft_l1",
+            max_nfev=max_nfev,
+        )
     fitted_constants = {
         str(symbol): float(value) for symbol, value in zip(constants, result.x)
     }

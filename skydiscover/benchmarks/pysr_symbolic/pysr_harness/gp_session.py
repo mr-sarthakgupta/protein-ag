@@ -56,8 +56,12 @@ def run_gp_session(
     if feature_names is None:
         feature_names = [f"x{i}" for i in range(X_train.shape[1])]
 
+    import warnings
+
     model = build_pysr_regressor(merged)
-    model.fit(X_train, y_train, variable_names=feature_names)
+    with warnings.catch_warnings(), np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
+        model.fit(X_train, y_train, variable_names=feature_names)
 
     equations = model.equations_
     if equations is None or len(equations) == 0:
@@ -83,12 +87,13 @@ def run_gp_session(
     loss = float(row["loss"])
 
     try:
-        y_pred_train = _predict_equation(
-            equation, X_train, feature_names=list(feature_names)
-        )
-        y_pred_val = _predict_equation(
-            equation, X_val, feature_names=list(feature_names)
-        )
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            y_pred_train = _predict_equation(
+                equation, X_train, feature_names=list(feature_names)
+            )
+            y_pred_val = _predict_equation(
+                equation, X_val, feature_names=list(feature_names)
+            )
     except Exception:
         y_pred_train = np.full_like(y_train, np.nan)
         y_pred_val = np.full_like(y_val, np.nan)

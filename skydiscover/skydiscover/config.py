@@ -264,11 +264,11 @@ class AgenticConfig:
     codebase_root: Optional[str] = None
 
     # Agent loop limits
-    max_steps: int = 5
+    max_steps: int = 8
 
     # Timeouts (seconds)
-    per_step_timeout: float = 60.0
-    overall_timeout: float = 300.0
+    per_step_timeout: float = 120.0
+    overall_timeout: float = 600.0
 
     # Context management
     max_context_chars: int = 400_000
