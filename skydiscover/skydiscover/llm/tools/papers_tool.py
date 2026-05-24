@@ -84,7 +84,7 @@ async def _s2_request(
             resp = await client.request(method, url, **kwargs)
             if resp.status_code == 429:
                 if attempt < 2:
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(5)
                     continue
                 return None
             if resp.status_code >= 500:
@@ -591,7 +591,7 @@ async def _s2_bulk_search(query: str, args: dict[str, Any], limit: int) -> ToolR
     params: dict[str, Any] = {
         "query": query,
         "limit": limit,
-        "fields": "title,externalIds,year,citationCount,tldr,venue,publicationDate",
+        "fields": "title,externalIds,year,citationCount,venue,publicationDate",
     }
 
     # Date filter
@@ -642,14 +642,13 @@ async def _op_search(args: dict[str, Any], limit: int) -> ToolResult:
     if not query:
         return _error("'query' is required for search operation.")
 
-    # Route to S2 when filters are present
-    use_s2 = any(args.get(k) for k in ("date_from", "date_to", "categories", "min_citations", "sort_by"))
-    if use_s2:
-        result = await _s2_bulk_search(query, args, limit)
-        if result is not None:
-            return result
-        # Fall back to HF search (without filters) if S2 fails
+    # Always try Semantic Scholar first — it covers all academic fields.
+    # HF papers search is ML-only and misses biology, chemistry, physics, etc.
+    result = await _s2_bulk_search(query, args, limit)
+    if result is not None and result.get("totalResults", 0) > 0:
+        return result
 
+    # Fall back to HF search if S2 returned nothing
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"{HF_API}/papers/search", params={"q": query, "limit": limit}
@@ -1067,7 +1066,9 @@ async def _op_snippet_search(args: dict[str, Any], limit: int) -> ToolResult:
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await _s2_request(client, "GET", "/graph/v1/snippet/search", params=params)
         if not resp or resp.status_code != 200:
-            return _error("Snippet search failed. Semantic Scholar may be unavailable.")
+            # Snippet endpoint is rate-limited without an API key.
+            # Fall back to a regular search so the agent still gets results.
+            return await _op_search(args, limit)
         data = resp.json()
 
     snippets = data.get("data") or []

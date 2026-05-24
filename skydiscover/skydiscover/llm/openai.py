@@ -177,15 +177,17 @@ class OpenAILLM(LLMInterface):
                     raise
 
     async def _call_api(self, params: Dict[str, Any]) -> str:
+        from skydiscover.llm.cost_tracker import global_cost_tracker
+
+        global_cost_tracker.check_budget()
         loop = asyncio.get_running_loop()
         try:
             response = await loop.run_in_executor(
                 None, lambda: self.client.chat.completions.create(**params)
             )
+            self._record_openai_usage(response.usage)
             return response.choices[0].message.content
         except (openai.BadRequestError, openai.APIStatusError) as exc:
-            # Some Azure deployments only expose the Responses API.
-            # Fall back transparently when Chat Completions is unsupported.
             if "unsupported" not in str(exc).lower() and "not found" not in str(exc).lower():
                 raise
             logger.info("Chat Completions unsupported; falling back to Responses API")
@@ -194,6 +196,9 @@ class OpenAILLM(LLMInterface):
     async def _call_api_via_responses(self, params: Dict[str, Any]) -> str:
         """Translate a Chat-Completions-style *params* dict into a Responses API
         call and return the assistant text."""
+        from skydiscover.llm.cost_tracker import global_cost_tracker
+
+        global_cost_tracker.check_budget()
         messages = params.get("messages", [])
         input_items = convert_messages_to_responses_input(
             [m for m in messages if m.get("role") != "system"]
@@ -218,8 +223,48 @@ class OpenAILLM(LLMInterface):
         response = await loop.run_in_executor(
             None, lambda: self.client.responses.create(**resp_params)
         )
+        self._record_responses_usage(response)
         text, _, _ = extract_responses_output(response)
         return text or ""
+
+    def _record_openai_usage(self, usage) -> None:
+        """Record token usage from a Chat Completions response."""
+        if usage is None:
+            return
+        from skydiscover.llm.cost_tracker import global_cost_tracker
+
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        cache_read = 0
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details:
+            cache_read = getattr(details, "cached_tokens", 0) or 0
+        global_cost_tracker.record_usage(
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            cache_read_tokens=cache_read,
+            model=self.model,
+        )
+
+    def _record_responses_usage(self, response) -> None:
+        """Record token usage from a Responses API response."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        from skydiscover.llm.cost_tracker import global_cost_tracker
+
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
+        cache_read = 0
+        details = getattr(usage, "input_tokens_details", None)
+        if details:
+            cache_read = getattr(details, "cached_tokens", 0) or 0
+        global_cost_tracker.record_usage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read,
+            model=self.model,
+        )
 
     def _resolve_retry_options(self, **kwargs) -> Tuple[int, int, int]:
         """Resolve retry/timeout options from kwargs, falling back to instance defaults."""

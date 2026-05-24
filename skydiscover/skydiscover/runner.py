@@ -172,11 +172,18 @@ class Runner:
                 self._save_checkpoint(iteration)
 
             # MAIN LOOP: Run the discovery
-            await self.discovery_controller.run_discovery(
-                discovery_start,
-                max_iterations,
-                checkpoint_callback=checkpoint_cb,
-            )
+            from skydiscover.llm.cost_tracker import CostLimitExceeded
+
+            try:
+                await self.discovery_controller.run_discovery(
+                    discovery_start,
+                    max_iterations,
+                    checkpoint_callback=checkpoint_cb,
+                )
+            except CostLimitExceeded as exc:
+                logger.info("Cost limit reached, stopping discovery: %s", exc)
+                print(f"\nCost limit reached: {exc}")
+                print("Saving best result found so far...")
 
             self._sync_database()
             final_iteration = discovery_start + max_iterations - 1

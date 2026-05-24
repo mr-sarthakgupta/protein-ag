@@ -319,8 +319,8 @@ class AgenticConfig:
     # Command execution (run_command tool)
     run_command_enabled: bool = True
     allow_unsafe_commands: bool = False  # if True, tool may run via shell=True when requested
-    run_command_default_timeout: int = 30
-    run_command_max_timeout: int = 120
+    run_command_default_timeout: int = 100
+    run_command_max_timeout: int = 300
     run_command_max_output_chars: int = 20_000
 
 

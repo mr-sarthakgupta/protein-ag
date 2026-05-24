@@ -51,7 +51,7 @@ def _load_fit_table(data_file: Path = DATA_FILE) -> tuple[np.ndarray, np.ndarray
                 continue
             measurement_x = float(row[0])
             for concentration, value in zip(concentrations, row[1:]):
-                if value == "":
+                if value == "" or value.strip().lower() == "nan":
                     continue
                 features.append([measurement_x, concentration])
                 targets.append(float(value))

@@ -10,14 +10,9 @@ random_seed: 42
 
 llm:
   models:
-    - name: "gpt-5-mini"
+    - name: "us.anthropic.claude-sonnet-4-6"
       weight: 1.0
-  api_base: "https://api.openai.com/v1"
-  # To use AWS Bedrock instead, install boto3 or `uv sync --extra bedrock`, set
-  # AWS credentials, and use:
-  # models:
-  #   - name: "bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
-  # api_base: "bedrock:us-east-1"
+  api_base: "bedrock:"
   temperature: 0.7
   max_tokens: 16000
   timeout: 600
@@ -26,57 +21,59 @@ prompt:
   system_message: |
     You are an expert in symbolic regression and biochemical kinetic curve fitting.
 
-    This benchmark uses SkyDiscover's EvoX / AdaEvolve as the actual evolutionary
-    algorithms. Each candidate program is an individual in that search. Your task is
-    to improve the Python function `evaluate_symbolic_candidate(X_train, y_train, X_val, y_val)` in the
-    EVOLVE-BLOCK so that it constructs a better symbolic equation candidate.
+    ## Dataset
+    Alpha-synuclein (aSyn) seeded aggregation kinetics from Gaspar et al. 2017,
+    with 0.3 uM seed across 8 monomer concentrations (1–50 uM). The data shows
+    sigmoidal ThT fluorescence curves — a hallmark of nucleation-dependent
+    polymerization. The dataset is in `fit.tsv` (wide table, already rescaled 0→1).
 
-    The dataset is copied into this benchmark as `fit.tsv` from:
-    `past-published-data/disease-relevant non-inhibited/Alphasyn_Gaspar2017/03uM_seed all/fit.tsv`.
-    The evaluator converts the wide table into a regression dataset with:
-    - x0 = measurement coordinate `X`
-    - x1 = concentration in uM parsed from each response column
-    - y = rescaled response value
+    The evaluator converts the table into a regression dataset:
+    - x0 = measurement time coordinate (X column)
+    - x1 = monomer concentration in uM (parsed from column headers)
+    - y  = rescaled ThT response (0 to 1)
 
-    PySR is only a component library here. Use it through `pysr_harness` for useful
-    symbolic-regression building blocks such as PySR-compatible feature symbols,
-    tunable constants, expression export/evaluation, simplification, and fitting the
-    continuous constants inside a proposed equation.
+    ## Research tools (use them!)
+    You have internet access. Use it to find better kinetic models:
+    - `web_search`: Search for "alpha-synuclein aggregation kinetics equation",
+      "Finke-Watzky two-step model", "Avrami nucleation model", "seeded amyloid
+      sigmoidal fit", etc.
+    - `research_papers`: Search arXiv and Semantic Scholar for papers on amyloid
+      aggregation kinetics, nucleation-elongation models, or secondary nucleation.
+    - `fetch_webpage`: Download promising URLs (e.g. Wikipedia, review articles).
+    - `read_file`: Read the data file and harness code to understand the API.
 
-    Do **not** make PySR the algorithm:
-    - Do not call `PySRRegressor.fit`.
-    - Do not call `run_gp_session`.
-    - Do not run PySR / SymbolicRegression.jl's `equation_search`.
-    - Do not optimize PySR hyperparameters, operator weights, population sizes, or
-      mutation probabilities as the main task.
+    Look at the data first (`fit.tsv`), then search the literature for established
+    kinetic models that fit sigmoidal aggregation curves with concentration dependence.
+
+    ## Task
+    Improve the `evaluate_symbolic_candidate()` function in the EVOLVE-BLOCK.
+    Build an explicit symbolic expression template using the `pysr_harness` API.
 
     Use `pysr_harness.equation_session` helpers:
-    - `feature_symbols(n)` creates PySR-compatible variables `x0`, `x1`, ...
-    - `constant_symbols(n)` creates tunable constants `c0`, `c1`, ...
-    - `pysr_operator_names()` lists the available PySR unary, binary, and ternary
-      operator names.
-    - `pysr_operator_namespace()` returns PySR-to-SymPy callables for named
-      operators such as `sin`, `cos`, `sqrt`, `log1p`, `max`, `min`, `muladd`,
-      and `clamp`.
+    - `feature_symbols(n)` → PySR variables `x0`, `x1`, ...
+    - `constant_symbols(n)` → tunable constants `c0`, `c1`, ...
     - `evaluate_expression(expr, X_train, y_train, X_val, y_val, constants=...)`
-      fits constants in the proposed equation, simplifies/exports it, and returns
-      evaluator metrics.
+      fits constants via least-squares and returns scored metrics.
 
-    Improve the equation-discovery candidate inside `evaluate_symbolic_candidate()`:
-    - Build an explicit symbolic expression or expression template.
-    - Combine measurement coordinate and concentration with PySR/SymPy-compatible
-      operators such as `+`, `-`, `*`, `/`, `exp`, `log`, powers, and low-complexity
-      compositions.
-    - Prefer numerically stable kinetic forms such as saturating growth, exponential
-      relaxation, Hill-like concentration effects, rational concentration terms, or
-      other simple equations justified by the tabulated curves.
-    - Use tunable constants for scales, offsets, rates, exponents, and interaction
-      weights.
-    - Keep expressions numerically stable, reasonably simple, and general; do not
-      hardcode target values, validation rows, or data table indices.
+    ## Equation design guidance
+    The sigmoidal curves suggest models like:
+    - Exponential approach: y = 1 - exp(-k*t^n) (Avrami/stretched exponential)
+    - Finke-Watzky: y = (k1/k2)(exp((k1+k2*C)*t)-1) / (1 + (k1/k2)*exp((k1+k2*C)*t))
+    - Logistic/Hill: y = t^n / (t_half^n + t^n) with concentration-dependent t_half
+    - Secondary nucleation: concentration affects both lag time and growth rate
 
-    The evaluator scores validation NMSE; higher `combined_score` is better
-    (1 / (1 + nmse_val)). Keep runtime reasonable — the evaluator enforces a timeout.
+    The concentration dependence should appear in rate constants, half-times, or
+    exponents — NOT as separate additive terms.
+
+    ## Constraints
+    - Do NOT call PySRRegressor.fit, run_gp_session, or equation_search.
+    - Keep expressions numerically stable and general.
+    - Do not hardcode data values or indices.
+    - The evaluator scores validation NMSE; higher `combined_score` = 1/(1+nmse_val)
+      is better. Keep runtime reasonable (600s timeout).
+
+search:
+  share_llm: true  # evox: inherit Bedrock LLM for meta-search evolution
 
 evaluator:
   timeout: 600
@@ -84,6 +81,26 @@ evaluator:
   cascade_thresholds:
     - 0.2
     - 0.5
+
+agentic:
+  enabled: true
+  codebase_root: "${BENCHMARK_CODEBASE_ROOT}"
+  max_steps: 6
+  per_step_timeout: 120.0
+  overall_timeout: 360.0
+  max_context_chars: 400000
+  max_file_chars: 50000
+  max_files_read: 25
+  allowed_extensions:
+    - ".py"
+    - ".txt"
+    - ".md"
+    - ".json"
+    - ".yaml"
+    - ".yml"
+    - ".toml"
+    - ".tsv"
+    - ".csv"
 
 monitor:
   enabled: true

@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Maximum wall-clock seconds the subprocess may run (default; can be overridden by config/tool args).
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 100
 
 # Maximum characters of combined stdout+stderr returned to the agent (default; can be overridden by config).
 DEFAULT_MAX_OUTPUT_CHARS = 20_000
@@ -97,11 +97,18 @@ _ALLOWED_EXECUTABLES: frozenset[str] = frozenset(
 # These substrings in the raw command string are unconditionally blocked
 # regardless of the executable, to prevent shell injection via pipes /
 # redirection that write outside the sandbox.
-_BLOCKED_PATTERNS: list[re.Pattern] = [
-    re.compile(r"[|&;`$]"),          # shell operators / command substitution
-    re.compile(r">{1,2}"),           # stdout redirect (writes files)
-    re.compile(r"<\("),              # process substitution
-    re.compile(r"\brm\b"),           # deletion
+# Shell metacharacters — only dangerous in shell=True mode (unsafe).
+# With shell=False these are harmless characters in argv strings.
+_SHELL_PATTERNS: list[re.Pattern] = [
+    re.compile(r"[|&;`]"),
+    re.compile(r"\$[({]"),
+    re.compile(r">{1,2}"),
+    re.compile(r"<\("),
+]
+
+# Destructive / network executables — blocked in both modes.
+_BLOCKED_EXECUTABLES: list[re.Pattern] = [
+    re.compile(r"\brm\b"),
     re.compile(r"\bchmod\b"),
     re.compile(r"\bchown\b"),
     re.compile(r"\bsudo\b"),
@@ -111,7 +118,7 @@ _BLOCKED_PATTERNS: list[re.Pattern] = [
     re.compile(r"\bscp\b"),
     re.compile(r"\brsync\b"),
     re.compile(r"\bssh\b"),
-    re.compile(r"\bnc\b"),           # netcat
+    re.compile(r"\bnc\b"),
     re.compile(r"\bkill\b"),
     re.compile(r"\bpkill\b"),
     re.compile(r"\bmv\b"),
@@ -120,7 +127,6 @@ _BLOCKED_PATTERNS: list[re.Pattern] = [
     re.compile(r"\bmkdir\b"),
     re.compile(r"\brmdir\b"),
     re.compile(r"\btouch\b"),
-    re.compile(r"\bchmod\b"),
     re.compile(r"\bln\b"),
     re.compile(r"\binstall\b"),
     re.compile(r"\bapt\b"),
@@ -130,15 +136,17 @@ _BLOCKED_PATTERNS: list[re.Pattern] = [
 ]
 
 
-def _check_command_safety(command: str) -> str | None:
+def _check_command_safety(command: str, *, unsafe: bool = False) -> str | None:
     """Return an error string if *command* is unsafe, else None."""
-    # Reject blocked shell operators / destructive patterns first.
-    for pat in _BLOCKED_PATTERNS:
-        if pat.search(command):
-            return (
-                f"Command blocked: contains forbidden pattern '{pat.pattern}'. "
-                "Only read-only, non-network commands without shell operators are allowed."
-            )
+    # Shell metacharacters only matter when running via shell=True.
+    # With shell=False, subprocess passes argv directly — no redirects/pipes.
+    if unsafe:
+        for pat in _SHELL_PATTERNS:
+            if pat.search(command):
+                return (
+                    f"Command blocked: contains forbidden pattern '{pat.pattern}'. "
+                    "Only read-only, non-network commands without shell operators are allowed."
+                )
 
     # Parse the first token as the executable name.
     try:
@@ -150,6 +158,15 @@ def _check_command_safety(command: str) -> str | None:
         return "Empty command."
 
     exe = os.path.basename(tokens[0])
+
+    # Destructive / network executables are blocked regardless of mode.
+    for pat in _BLOCKED_EXECUTABLES:
+        if pat.fullmatch(exe):
+            return (
+                f"Command blocked: '{exe}' is not allowed. "
+                "Only read-only, non-network commands are allowed."
+            )
+
     if exe not in _ALLOWED_EXECUTABLES:
         allowed_sorted = ", ".join(sorted(_ALLOWED_EXECUTABLES))
         return (

@@ -19,6 +19,7 @@ from skydiscover.llm.responses_utils import (
 from skydiscover.utils.code_utils import build_repo_map
 
 logger = logging.getLogger(__name__)
+_agentic_log = logging.getLogger("skydiscover.agentic_trace")
 
 _TOOL_SCHEMAS_PATH = Path(__file__).parent / "tool_schemas" / "agentic_tools.json"
 with open(_TOOL_SCHEMAS_PATH, "r") as _f:
@@ -64,6 +65,7 @@ class AgenticGenerator:
         cfg = self.config
         files_read: set = set()
         conversation: List[Dict[str, Any]] = []
+        trace_log: List[Dict[str, Any]] = []
         t0 = time.time()
 
         sys_prompt = f"{system_message}\n\n{_AGENTIC_SYSTEM_PROMPT}"
@@ -119,6 +121,7 @@ class AgenticGenerator:
                     logger.info(
                         "Agent produced text at step %d (%d files read)", step, len(files_read)
                     )
+                    self._save_trace(trace_log, conversation)
                     return text_content
                 conversation.append(
                     {
@@ -155,23 +158,54 @@ class AgenticGenerator:
                 conversation.append(
                     {"role": "tool", "tool_call_id": tc_id, "content": result["content"]}
                 )
+                trace_log.append({
+                    "step": step, "tool": name, "args": args,
+                    "result_len": len(result.get("content", "")),
+                })
 
+        self._save_trace(trace_log, conversation)
         logger.warning("Agent loop ended without producing code")
         return None
+
+    def _save_trace(self, trace_log: list, conversation: list) -> None:
+        """Persist the agentic trace to a JSON file under codebase_root/reference/."""
+        try:
+            root = self.config.codebase_root
+            if not root:
+                return
+            ref_dir = os.path.join(root, "reference")
+            os.makedirs(ref_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(ref_dir, f"agentic_trace_{ts}.json")
+            payload = {
+                "timestamp": ts,
+                "tool_calls": trace_log,
+                "conversation": _serialize_conversation(conversation),
+            }
+            with open(path, "w") as f:
+                json.dump(payload, f, indent=2, default=str)
+            _agentic_log.info("Agentic trace saved to %s", path)
+        except Exception as e:
+            logger.debug("Failed to save agentic trace: %s", e)
 
     async def _call_llm(
         self, system_message: str, conversation: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Call a sampled LLM with tool schemas.
 
-        Tries Chat Completions first; falls back to Responses API if the
-        deployment does not support Chat Completions (common on Azure).
+        Routes to Bedrock Converse API for BedrockLLM, otherwise uses
+        Chat Completions with Responses API fallback.
         """
         model = self.llm_pool.models[
             self.llm_pool.random_state.choices(
                 range(len(self.llm_pool.models)), weights=self.llm_pool.weights, k=1
             )[0]
         ]
+
+        from skydiscover.llm.bedrock import BedrockLLM
+
+        if isinstance(model, BedrockLLM):
+            return await self._call_llm_bedrock(model, system_message, conversation)
 
         if not hasattr(model, "client"):
             raise RuntimeError(
@@ -204,6 +238,9 @@ class AgenticGenerator:
             if model.max_tokens is not None:
                 params["max_tokens"] = model.max_tokens
 
+        from skydiscover.llm.cost_tracker import global_cost_tracker
+
+        global_cost_tracker.check_budget()
         loop = asyncio.get_running_loop()
         try:
             resp = await loop.run_in_executor(
@@ -216,6 +253,7 @@ class AgenticGenerator:
             model._use_responses_api = True
             return await self._call_llm_responses(model, system_message, conversation)
 
+        _record_openai_chat_usage(resp.usage, model.model)
         msg = resp.choices[0].message
         out: Dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
         if msg.tool_calls:
@@ -258,16 +296,93 @@ class AgenticGenerator:
             if model.max_tokens is not None:
                 resp_params["max_output_tokens"] = model.max_tokens
 
+        from skydiscover.llm.cost_tracker import global_cost_tracker
+
+        global_cost_tracker.check_budget()
         loop = asyncio.get_running_loop()
         resp = await loop.run_in_executor(
             None, lambda: model.client.responses.create(**resp_params)
         )
 
+        _record_responses_api_usage(resp, model.model)
         text, _, tool_calls = extract_responses_output(resp)
         out: Dict[str, Any] = {"role": "assistant", "content": text}
         if tool_calls:
             out["tool_calls"] = tool_calls
         return out
+
+    # ------------------------------------------------------------------
+    # Bedrock Converse API (tool use)
+    # ------------------------------------------------------------------
+
+    async def _call_llm_bedrock(
+        self,
+        model,
+        system_message: str,
+        conversation: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Call Bedrock Converse API with native tool use support and retries."""
+        from skydiscover.llm.cost_tracker import global_cost_tracker
+
+        global_cost_tracker.check_budget()
+
+        bedrock_messages = _conv_to_bedrock(conversation)
+        tool_config = _bedrock_tool_config()
+
+        params: Dict[str, Any] = {
+            "modelId": model.model,
+            "messages": bedrock_messages,
+            "system": [{"text": system_message}],
+            "toolConfig": tool_config,
+        }
+
+        inference_config: Dict[str, Any] = {}
+        if model.max_tokens:
+            inference_config["maxTokens"] = int(model.max_tokens)
+        if model.temperature is not None:
+            inference_config["temperature"] = float(model.temperature)
+        if inference_config:
+            params["inferenceConfig"] = inference_config
+
+        retries, retry_delay, timeout = model._resolve_retry_options()
+
+        for attempt in range(retries + 1):
+            try:
+                loop = asyncio.get_running_loop()
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: model.client.converse(**params)),
+                    timeout=timeout,
+                )
+                break
+            except asyncio.TimeoutError:
+                if attempt < retries:
+                    logger.warning(
+                        "Bedrock agentic timeout attempt %d/%d, retrying...",
+                        attempt + 1, retries + 1,
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    raise
+            except Exception as exc:
+                if attempt < retries:
+                    logger.warning(
+                        "Bedrock agentic error attempt %d/%d: %s, retrying...",
+                        attempt + 1, retries + 1, exc,
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    raise
+
+        usage = response.get("usage", {})
+        global_cost_tracker.record_usage(
+            input_tokens=usage.get("inputTokens", 0),
+            output_tokens=usage.get("outputTokens", 0),
+            cache_read_tokens=usage.get("cacheReadInputTokens", 0),
+            cache_write_tokens=usage.get("cacheWriteInputTokens", 0),
+            model=model.model,
+        )
+
+        return _parse_bedrock_response(response)
 
     # ------------------------------------------------------------------
     # Tools
@@ -430,6 +545,47 @@ class AgenticGenerator:
 # ------------------------------------------------------------------
 
 
+def _record_openai_chat_usage(usage, model_name: str) -> None:
+    """Record token usage from an OpenAI Chat Completions response."""
+    if usage is None:
+        return
+    from skydiscover.llm.cost_tracker import global_cost_tracker
+
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+    cache_read = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details:
+        cache_read = getattr(details, "cached_tokens", 0) or 0
+    global_cost_tracker.record_usage(
+        input_tokens=prompt_tokens,
+        output_tokens=completion_tokens,
+        cache_read_tokens=cache_read,
+        model=model_name,
+    )
+
+
+def _record_responses_api_usage(response, model_name: str) -> None:
+    """Record token usage from an OpenAI Responses API response."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    from skydiscover.llm.cost_tracker import global_cost_tracker
+
+    input_tokens = getattr(usage, "input_tokens", 0) or 0
+    output_tokens = getattr(usage, "output_tokens", 0) or 0
+    cache_read = 0
+    details = getattr(usage, "input_tokens_details", None)
+    if details:
+        cache_read = getattr(details, "cached_tokens", 0) or 0
+    global_cost_tracker.record_usage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read,
+        model=model_name,
+    )
+
+
 def _err(msg: str) -> Dict[str, Any]:
     return {"content": msg, "_error": True}
 
@@ -508,6 +664,132 @@ def _validate_path(
         return False, "", f"Extension '{ext}' not allowed."
 
     return True, resolved, ""
+
+
+def _serialize_conversation(conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Produce a JSON-safe copy of the conversation (truncate large tool results)."""
+    out: List[Dict[str, Any]] = []
+    for msg in conversation:
+        entry: Dict[str, Any] = {"role": msg.get("role", "")}
+        content = msg.get("content", "")
+        if len(content) > 2000:
+            entry["content"] = content[:1000] + f"\n...[{len(content)} chars total]...\n" + content[-500:]
+        else:
+            entry["content"] = content
+        if "tool_calls" in msg:
+            entry["tool_calls"] = msg["tool_calls"]
+        if "tool_call_id" in msg:
+            entry["tool_call_id"] = msg["tool_call_id"]
+        out.append(entry)
+    return out
+
+
+# ------------------------------------------------------------------
+# Bedrock Converse format converters
+# ------------------------------------------------------------------
+
+
+def _bedrock_tool_config() -> Dict[str, Any]:
+    """Convert OpenAI tool schemas to Bedrock toolConfig format."""
+    tools = []
+    for schema in TOOL_SCHEMAS:
+        fn = schema["function"]
+        params = dict(fn["parameters"])
+        params.pop("additionalProperties", None)
+        tools.append({
+            "toolSpec": {
+                "name": fn["name"],
+                "description": fn["description"],
+                "inputSchema": {"json": params},
+            }
+        })
+    return {"tools": tools}
+
+
+def _conv_to_bedrock(conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert OpenAI-format conversation to Bedrock Converse messages.
+
+    Handles: user text, assistant text+tool_calls, and consecutive tool
+    result messages (grouped into a single user message as toolResult blocks).
+    """
+    bedrock_msgs: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(conversation):
+        msg = conversation[i]
+        role = msg.get("role")
+
+        if role == "user":
+            text = msg.get("content", "") or " "
+            bedrock_msgs.append({"role": "user", "content": [{"text": text}]})
+            i += 1
+
+        elif role == "assistant":
+            content: List[Dict[str, Any]] = []
+            text = msg.get("content", "")
+            if text:
+                content.append({"text": text})
+            for tc in msg.get("tool_calls", []):
+                fn = tc.get("function", {})
+                try:
+                    tool_input = json.loads(fn.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    tool_input = {}
+                content.append({
+                    "toolUse": {
+                        "toolUseId": tc.get("id", f"tc_{i}"),
+                        "name": fn.get("name", ""),
+                        "input": tool_input,
+                    }
+                })
+            bedrock_msgs.append({"role": "assistant", "content": content or [{"text": " "}]})
+            i += 1
+
+        elif role == "tool":
+            tool_results: List[Dict[str, Any]] = []
+            while i < len(conversation) and conversation[i].get("role") == "tool":
+                tr = conversation[i]
+                tool_results.append({
+                    "toolResult": {
+                        "toolUseId": tr.get("tool_call_id", f"tc_{i}"),
+                        "content": [{"text": tr.get("content", "")}],
+                        "status": "success",
+                    }
+                })
+                i += 1
+            bedrock_msgs.append({"role": "user", "content": tool_results})
+
+        else:
+            i += 1
+
+    return bedrock_msgs
+
+
+def _parse_bedrock_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Bedrock Converse response to internal OpenAI-like format."""
+    output = response.get("output", {}).get("message", {})
+    content_blocks = output.get("content", [])
+
+    text_parts: List[str] = []
+    tool_calls: List[Dict[str, Any]] = []
+
+    for block in content_blocks:
+        if "text" in block:
+            text_parts.append(block["text"])
+        elif "toolUse" in block:
+            tu = block["toolUse"]
+            tool_calls.append({
+                "id": tu.get("toolUseId", ""),
+                "type": "function",
+                "function": {
+                    "name": tu.get("name", ""),
+                    "arguments": json.dumps(tu.get("input", {})),
+                },
+            })
+
+    result: Dict[str, Any] = {"role": "assistant", "content": "\n".join(text_parts)}
+    if tool_calls:
+        result["tool_calls"] = tool_calls
+    return result
 
 
 _NESTED_QUANTIFIER_RE = re.compile(r"\([^)]*[+*][^)]*\)\s*[+*?]|\([^)]*[+*][^)]*\)\s*\{")

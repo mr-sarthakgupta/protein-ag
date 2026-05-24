@@ -12,6 +12,7 @@ import html
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -24,7 +25,12 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SEARCH_URL = "https://html.duckduckgo.com/html/"
 WEB_SEARCH_BASE_URL_ENV = "CLAWD_WEB_SEARCH_BASE_URL"
-USER_AGENT = "clawd-rust-tools/0.1"
+AUTO_FETCH_COUNT = 3
+AUTO_FETCH_PREVIEW_CHARS = 3000
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 REQUEST_TIMEOUT_SECONDS = 20
 MAX_RESULTS = 8
 
@@ -168,6 +174,118 @@ def dedupe_hits(hits: list[SearchHit]) -> list[SearchHit]:
     return deduped
 
 
+_SKIP_URL_PATTERNS = ("duckduckgo.com/y.js", "duckduckgo.com/l/")
+
+
+def _is_fetchable_hit(hit: SearchHit) -> bool:
+    """Skip ad redirects and non-content URLs."""
+    return not any(pat in hit.url for pat in _SKIP_URL_PATTERNS)
+
+
+def _robust_html_to_text(raw_html: str) -> str:
+    """Extract text from HTML, with a regex fallback for stubborn pages."""
+    from skydiscover.llm.tools.fetch_webpage_tool import html_to_text
+
+    text = html_to_text(raw_html)
+    if len(text.strip()) >= 100:
+        return text
+    # Fallback: strip tags with regex, collapse whitespace
+    stripped = re.sub(r"<script[^>]*>.*?</script>", " ", raw_html, flags=re.DOTALL | re.IGNORECASE)
+    stripped = re.sub(r"<style[^>]*>.*?</style>", " ", stripped, flags=re.DOTALL | re.IGNORECASE)
+    stripped = re.sub(r"<[^>]+>", " ", stripped)
+    stripped = html.unescape(stripped)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    return stripped
+
+
+def _auto_fetch_top_hits(
+    hits: list[SearchHit],
+    max_fetch: int = AUTO_FETCH_COUNT,
+    max_chars: int = AUTO_FETCH_PREVIEW_CHARS,
+) -> str:
+    """Fetch the top search result pages and return truncated text previews."""
+    fetchable = [h for h in hits if _is_fetchable_hit(h)]
+    previews: list[str] = []
+    for hit in fetchable:
+        if len(previews) >= max_fetch:
+            break
+        try:
+            resp = requests.get(
+                hit.url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=15,
+                allow_redirects=True,
+            )
+            if resp.status_code != 200:
+                continue
+            content_type = resp.headers.get("Content-Type", "")
+            if "pdf" in content_type or "octet-stream" in content_type:
+                continue
+            if "html" in content_type or not content_type:
+                text = _robust_html_to_text(resp.text)
+            else:
+                text = resp.text
+            text = text.strip()
+            if len(text) < 200 or "captcha" in text.lower() or "checking your browser" in text.lower():
+                continue
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n...(truncated)"
+            previews.append(f"### {hit.title}\nURL: {hit.url}\n\n{text}")
+        except Exception as exc:
+            logger.debug("auto-fetch failed for %s: %s", hit.url, exc)
+    return "\n\n---\n\n".join(previews)
+
+
+def _fetch_search_page(search_url: str) -> requests.Response:
+    return requests.get(
+        search_url,
+        headers={"User-Agent": USER_AGENT},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        allow_redirects=True,
+    )
+
+
+def _s2_fallback_search(query: str, limit: int = 10) -> list[SearchHit]:
+    """Fallback: search Semantic Scholar when DuckDuckGo is unavailable."""
+    try:
+        import httpx
+
+        resp = httpx.get(
+            "https://api.semanticscholar.org/graph/v1/paper/search/bulk",
+            params={
+                "query": query,
+                "limit": limit,
+                "fields": "title,externalIds,year,citationCount,venue,publicationDate",
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return []
+        papers = resp.json().get("data", [])
+        hits: list[SearchHit] = []
+        for p in papers:
+            title = p.get("title", "")
+            eids = p.get("externalIds") or {}
+            doi = eids.get("DOI")
+            arxiv = eids.get("ArXiv")
+            if doi:
+                url = f"https://doi.org/{doi}"
+            elif arxiv:
+                url = f"https://arxiv.org/abs/{arxiv}"
+            else:
+                s2_id = p.get("paperId", "")
+                url = f"https://www.semanticscholar.org/paper/{s2_id}" if s2_id else ""
+            year = p.get("year", "")
+            venue = p.get("venue", "")
+            suffix = f" ({venue}, {year})" if venue and year else f" ({year})" if year else ""
+            if url:
+                hits.append(SearchHit(title=f"{title}{suffix}", url=url))
+        return hits
+    except Exception as exc:
+        logger.debug("S2 fallback search failed: %s", exc)
+        return []
+
+
 def execute_web_search(
     query: str,
     allowed_domains: list[str] | None = None,
@@ -176,16 +294,28 @@ def execute_web_search(
 ) -> dict[str, Any]:
     started = time.monotonic()
     search_url = build_search_url(query)
-    response = requests.get(
-        search_url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        allow_redirects=True,
-    )
 
-    hits = extract_search_hits(response.text)
+    hits: list[SearchHit] = []
+    for attempt in range(2):
+        response = _fetch_search_page(search_url)
+        hits = extract_search_hits(response.text)
+        if hits:
+            break
+        if attempt == 0:
+            time.sleep(1)
+
     if not hits and urlparse(response.url or search_url).hostname:
         hits = extract_search_hits_from_generic_links(response.text)
+
+    # Filter out DDG's own pages (homepage, redirects) that aren't real results.
+    hits = [h for h in hits if not h.url.rstrip("/").endswith("duckduckgo.com/html")]
+
+    # Fallback to Semantic Scholar academic search when DDG returns nothing.
+    used_s2_fallback = False
+    if not hits:
+        logger.info("web_search: DDG returned no results, falling back to Semantic Scholar")
+        hits = _s2_fallback_search(query, limit=MAX_RESULTS)
+        used_s2_fallback = bool(hits)
 
     if allowed_domains is not None:
         hits = [hit for hit in hits if host_matches_list(hit.url, allowed_domains)]
@@ -194,17 +324,25 @@ def execute_web_search(
 
     hits = dedupe_hits(hits)[:MAX_RESULTS]
     logger.info(
-        "web_search: query=%r results=%d (%.1fs)",
+        "web_search: query=%r results=%d%s (%.1fs)",
         query,
         len(hits),
+        " [S2 fallback]" if used_s2_fallback else "",
         time.monotonic() - started,
     )
+
+    # Auto-fetch top results to give the agent actual content
+    page_previews = _auto_fetch_top_hits(hits, max_fetch=AUTO_FETCH_COUNT)
+
     rendered_hits = "\n".join(f"- [{hit.title}]({hit.url})" for hit in hits)
     if hits:
+        source_note = " (via Semantic Scholar academic search)" if used_s2_fallback else ""
         summary = (
-            f"Search results for {query!r}. Include a Sources section in the final answer.\n"
+            f"Search results for {query!r}{source_note}. Include a Sources section in the final answer.\n"
             f"{rendered_hits}"
         )
+        if page_previews:
+            summary += "\n\n--- Fetched page previews ---\n" + page_previews
     else:
         summary = f"No web search results matched the query {query!r}."
 

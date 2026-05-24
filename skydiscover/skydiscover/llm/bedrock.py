@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import configparser
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from skydiscover.config import LLMModelConfig
@@ -46,6 +48,49 @@ def _region_from_api_base(api_base: Optional[str]) -> Optional[str]:
     return None
 
 
+def _bedrock_api_key_from_aws_credentials(
+    profile: Optional[str] = None,
+    credentials_path: Optional[Path] = None,
+) -> Optional[str]:
+    """Return a Bedrock API key stored in aws_session_token, if present.
+
+    Bedrock bearer API keys use an ABSK prefix. They are not AWS STS session
+    tokens, but users sometimes place them in ~/.aws/credentials under
+    aws_session_token because both are token-like values.
+    """
+    credentials_path = credentials_path or Path(
+        os.environ.get("AWS_SHARED_CREDENTIALS_FILE", Path.home() / ".aws" / "credentials")
+    )
+    if not credentials_path.exists():
+        return None
+
+    parser = configparser.RawConfigParser()
+    parser.read(credentials_path)
+    section = profile or os.environ.get("AWS_PROFILE") or "default"
+    if not parser.has_section(section):
+        return None
+
+    token = parser.get(section, "aws_session_token", fallback="").strip()
+    if token.startswith("ABSK"):
+        return token
+    return None
+
+
+def _ensure_bedrock_bearer_token(profile: Optional[str] = None) -> bool:
+    if os.environ.get("AWS_BEARER_TOKEN_BEDROCK"):
+        return False
+
+    token = _bedrock_api_key_from_aws_credentials(profile)
+    if not token:
+        return False
+
+    os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
+    logger.info(
+        "Using Bedrock API key from aws_session_token as AWS_BEARER_TOKEN_BEDROCK"
+    )
+    return True
+
+
 class BedrockLLM(LLMInterface):
     """LLM backend using AWS Bedrock Runtime's Converse API."""
 
@@ -85,6 +130,7 @@ class BedrockLLM(LLMInterface):
         profile = os.environ.get("AWS_PROFILE")
         if profile:
             session_kwargs["profile_name"] = profile
+        _ensure_bedrock_bearer_token(profile)
         session = boto3.Session(**session_kwargs)
         self.client = session.client("bedrock-runtime", region_name=self.region)
 
@@ -170,9 +216,25 @@ class BedrockLLM(LLMInterface):
         return params
 
     async def _call_api(self, params: Dict[str, Any]) -> str:
+        from skydiscover.llm.cost_tracker import global_cost_tracker
+
+        global_cost_tracker.check_budget()
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(None, lambda: self.client.converse(**params))
+        self._record_usage(response)
         return self._extract_text(response)
+
+    def _record_usage(self, response: Dict[str, Any]) -> None:
+        from skydiscover.llm.cost_tracker import global_cost_tracker
+
+        usage = response.get("usage", {})
+        global_cost_tracker.record_usage(
+            input_tokens=usage.get("inputTokens", 0),
+            output_tokens=usage.get("outputTokens", 0),
+            cache_read_tokens=usage.get("cacheReadInputTokens", 0),
+            cache_write_tokens=usage.get("cacheWriteInputTokens", 0),
+            model=self.model,
+        )
 
     def _extract_text(self, response: Dict[str, Any]) -> str:
         content = response.get("output", {}).get("message", {}).get("content", [])

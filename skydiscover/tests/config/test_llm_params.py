@@ -1,5 +1,6 @@
 """Tests for LLM config: optional temperature/top_p and api_base routing."""
 
+import os
 from dataclasses import fields
 from unittest.mock import AsyncMock, patch
 
@@ -137,6 +138,65 @@ class TestBedrockLLMParams:
             [{"role": "user", "content": "hello"}],
         )
         assert params["inferenceConfig"] == {"maxTokens": 1024}
+
+    def test_detects_bedrock_api_key_in_session_token(self, tmp_path):
+        from skydiscover.llm.bedrock import _bedrock_api_key_from_aws_credentials
+
+        credentials = tmp_path / "credentials"
+        credentials.write_text(
+            "\n".join(
+                [
+                    "[default]",
+                    "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
+                    "aws_secret_access_key = example",
+                    "aws_session_token = ABSKexample",
+                ]
+            )
+        )
+
+        assert (
+            _bedrock_api_key_from_aws_credentials(credentials_path=credentials)
+            == "ABSKexample"
+        )
+
+    def test_ignores_sts_session_token_for_bedrock_api_key(self, tmp_path):
+        from skydiscover.llm.bedrock import _bedrock_api_key_from_aws_credentials
+
+        credentials = tmp_path / "credentials"
+        credentials.write_text(
+            "\n".join(
+                [
+                    "[default]",
+                    "aws_access_key_id = ASIAIOSFODNN7EXAMPLE",
+                    "aws_secret_access_key = example",
+                    "aws_session_token = IQoJb3JpZ2luX2VjEExample",
+                ]
+            )
+        )
+
+        assert _bedrock_api_key_from_aws_credentials(credentials_path=credentials) is None
+
+    def test_installs_bedrock_bearer_token_from_session_token(
+        self, monkeypatch, tmp_path
+    ):
+        from skydiscover.llm.bedrock import _ensure_bedrock_bearer_token
+
+        credentials = tmp_path / "credentials"
+        credentials.write_text(
+            "\n".join(
+                [
+                    "[default]",
+                    "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
+                    "aws_secret_access_key = example",
+                    "aws_session_token = ABSKexample",
+                ]
+            )
+        )
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials))
+
+        assert _ensure_bedrock_bearer_token() is True
+        assert os.environ["AWS_BEARER_TOKEN_BEDROCK"] == "ABSKexample"
 
 
 class TestOpenAILLMParams:
