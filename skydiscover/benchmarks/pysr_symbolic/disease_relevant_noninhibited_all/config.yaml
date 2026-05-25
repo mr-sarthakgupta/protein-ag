@@ -1,0 +1,122 @@
+# PySR symbolic benchmark: Universal amyloid aggregation kinetics
+# Multi-dataset fitting across ALL disease-relevant non-inhibited proteins
+# Usage: skydiscover-run initial_program.py evaluator.py -c config.yaml -s adaevolve|evox
+
+language: python
+diff_based_generation: true
+max_iterations: 50
+checkpoint_interval: 5
+max_solution_length: 60000
+random_seed: 42
+
+llm:
+  models:
+    - name: "us.anthropic.claude-sonnet-4-6"
+      weight: 1.0
+  api_base: "bedrock:"
+  temperature: 0.7
+  max_tokens: 16000
+  timeout: 600
+
+prompt:
+  system_message: |
+    You are an expert in symbolic regression and biochemical kinetic curve fitting.
+
+    ## Multi-Dataset Task
+    You are searching for a **universal equation** that governs amyloid protein
+    aggregation kinetics across ~60 datasets from 13 different protein systems
+    (Abeta, Alpha-synuclein, IAPP, SH3, beta-parvalbumin, biofilm proteins,
+    haemoglobin, hnRNPA, huntingtin, insulin, lysozyme, prion protein, serum
+    amyloid). All datasets live under:
+      /home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited/
+
+    Each dataset is a `fit.tsv` file (wide table, rescaled 0→1) with:
+    - x0 = measurement time coordinate (X column)
+    - x1 = varying experimental parameter (concentration in uM, pH, etc.,
+      extracted from column headers; sequential index if non-numeric)
+    - y  = rescaled response (0 to 1)
+
+    **Key constraint:** The equation STRUCTURE must be identical across all
+    datasets, but a separate set of constants is fitted independently for
+    each dataset. This means the equation captures the universal kinetic
+    mechanism while constants adapt to each protein system's specific rates.
+
+    ## Research tools (use them!)
+    You have internet access. Use it to find better kinetic models:
+    - `web_search`: Search for "amyloid aggregation kinetics universal equation",
+      "nucleation-elongation model", "Finke-Watzky two-step model", "Avrami
+      nucleation model", "sigmoidal amyloid fit", "secondary nucleation kinetics".
+    - `research_papers`: Search for papers on universal protein aggregation
+      mechanisms, Knowles/Vendruscolo/Dobson aggregation framework, etc.
+    - `fetch_webpage`: Download promising URLs.
+    - `read_file`: Read the data files and harness code.
+
+    ## Task
+    Improve the `evaluate_symbolic_candidate()` function in the EVOLVE-BLOCK.
+    Build an explicit symbolic expression template using the `pysr_harness` API.
+
+    Use `pysr_harness.equation_session` helpers:
+    - `feature_symbols(n)` → PySR variables `x0`, `x1`, ...
+    - `constant_symbols(n)` → tunable constants `c0`, `c1`, ...
+    - `evaluate_expression(expr, X_train, y_train, X_val, y_val, constants=...)`
+      fits constants via least-squares and returns scored metrics.
+
+    ## Equation design guidance
+    The sigmoidal/nucleation curves suggest models like:
+    - Logistic: y = A / (1 + exp(-k*(t - t_half))) + B
+    - Finke-Watzky: y = (k1/k2)(exp((k1+k2)*t)-1) / (1 + (k1/k2)*exp((k1+k2)*t))
+    - Avrami: y = 1 - exp(-k*t^n)
+    - Hill/sigmoidal: y = t^n / (t_half^n + t^n)
+    - Generalized logistic with concentration-dependent parameters
+
+    The equation must work for BOTH:
+    - Multi-concentration datasets (x1 = concentration) where rate/half-time
+      depends on concentration via power-law or similar
+    - Single-concentration datasets (x1 = 1) where the concentration-dependent
+      terms collapse to simple constants
+
+    Keep the number of constants moderate (5–10). Too many constants risk
+    overfitting on small datasets; too few risk underfitting complex kinetics.
+
+    ## Constraints
+    - Do NOT call PySRRegressor.fit, run_gp_session, or equation_search.
+    - Keep expressions numerically stable and general.
+    - Do not hardcode data values or indices.
+    - The evaluator scores mean validation NMSE across all datasets;
+      higher `combined_score` = 1/(1+mean_nmse) is better.
+    - Keep runtime reasonable (1200s timeout for all datasets combined).
+
+search:
+  share_llm: true
+
+evaluator:
+  timeout: 1200
+  cascade_evaluation: true
+  cascade_thresholds:
+    - 0.15
+    - 0.4
+
+agentic:
+  enabled: true
+  codebase_root: "${BENCHMARK_CODEBASE_ROOT}"
+  max_steps: 6
+  per_step_timeout: 120.0
+  overall_timeout: 360.0
+  max_context_chars: 400000
+  max_file_chars: 50000
+  max_files_read: 25
+  allowed_extensions:
+    - ".py"
+    - ".txt"
+    - ".md"
+    - ".json"
+    - ".yaml"
+    - ".yml"
+    - ".toml"
+    - ".tsv"
+    - ".csv"
+
+monitor:
+  enabled: true
+  port: 8765
+  host: "127.0.0.1"
