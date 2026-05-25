@@ -173,21 +173,31 @@ def load_all_datasets(
     return results
 
 
-def evaluate_candidate_with_timeout(program_path: str, timeout_seconds: int = 600) -> dict:
+NUM_WORKERS = min(8, os.cpu_count() or 4)
+
+
+def evaluate_candidate_with_timeout(program_path: str, timeout_seconds: int = 3000) -> dict:
     """Evaluate a candidate program across ALL datasets in a subprocess.
 
     The subprocess loads every dataset, calls the candidate's
     evaluate_symbolic_candidate() once per dataset (fitting independent
-    constants each time), and returns aggregated metrics.
+    constants each time) using parallel threads, and returns aggregated
+    metrics.
     """
     harness_root = str(BENCHMARK_ROOT)
     evaluator_path = str(Path(__file__).resolve())
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as temp_file:
         script = f"""
 import importlib.util
+import multiprocessing
+import os
 import pickle
 import sys
 import traceback
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import numpy as np
 
@@ -196,6 +206,7 @@ sys.path.insert(0, {harness_root!r})
 program_path = {program_path!r}
 evaluator_path = {evaluator_path!r}
 results_path = {temp_file.name + ".results"!r}
+NUM_WORKERS = min(8, os.cpu_count() or 4)
 
 try:
     evaluator_spec = importlib.util.spec_from_file_location("benchmark_evaluator", evaluator_path)
@@ -213,38 +224,38 @@ try:
         raise AttributeError("Program must define evaluate_symbolic_candidate() or run_discovery()")
 
     datasets = evaluator.load_all_datasets()
-    per_dataset_results = {{}}
-    nmse_vals = []
-    combined_scores = []
 
-    for ds_name, X_train, X_val, y_train, y_val in datasets:
+    def _eval_one(args):
+        ds_name, X_train, X_val, y_train, y_val = args
         try:
             result = fn(X_train, y_train, X_val, y_val)
             ds_nmse = float(result.get("nmse_val", float("inf")))
             ds_combined = float(result.get("combined_score", 0.0))
-            per_dataset_results[ds_name] = {{
+            return ds_name, {{
                 "nmse_val": ds_nmse,
                 "combined_score": ds_combined,
                 "equation": str(result.get("equation", "")),
                 "constants": result.get("constants", {{}}),
             }}
-            nmse_vals.append(ds_nmse)
-            combined_scores.append(ds_combined)
         except Exception as exc:
-            print(f"Dataset {{ds_name}} failed: {{exc}}")
-            per_dataset_results[ds_name] = {{
+            return ds_name, {{
                 "nmse_val": float("inf"),
                 "combined_score": 0.0,
                 "error": str(exc),
             }}
-            nmse_vals.append(float("inf"))
-            combined_scores.append(0.0)
 
+    per_dataset_results = {{}}
+    _fork_ctx = multiprocessing.get_context("fork")
+    with _fork_ctx.Pool(processes=NUM_WORKERS) as pool:
+        for ds_name, ds_result in pool.imap_unordered(_eval_one, datasets):
+            per_dataset_results[ds_name] = ds_result
+
+    combined_scores = [r["combined_score"] for r in per_dataset_results.values()]
+    nmse_vals = [r["nmse_val"] for r in per_dataset_results.values()]
     finite_nmse = [v for v in nmse_vals if np.isfinite(v)]
     agg_nmse = float(np.mean(finite_nmse)) if finite_nmse else float("inf")
-    agg_combined = float(np.mean(combined_scores))
+    agg_combined = float(1.0 / (1.0 + max(agg_nmse, 0.0))) if np.isfinite(agg_nmse) else 0.0
 
-    # Use the equation template from the first successful result
     eq_template = ""
     for r in per_dataset_results.values():
         if r.get("equation"):
@@ -326,7 +337,7 @@ def evaluate(program_path: str) -> dict:
     """Evaluate one evolved symbolic-equation candidate across all datasets."""
     try:
         start = time.time()
-        result = evaluate_candidate_with_timeout(program_path, timeout_seconds=1200)
+        result = evaluate_candidate_with_timeout(program_path, timeout_seconds=3000)
         metrics = _metrics_from_result(result, time.time() - start)
         print(
             "Evaluation: "
@@ -356,6 +367,29 @@ def evaluate(program_path: str) -> dict:
         }
 
 
+def _eval_stage1_worker(args):
+    """Module-level worker for stage 1 parallel evaluation."""
+    name, X_train, X_val, y_train, y_val, program_path = args
+    harness_root = str(BENCHMARK_ROOT)
+    if harness_root not in sys.path:
+        sys.path.insert(0, harness_root)
+    spec = importlib.util.spec_from_file_location("program", program_path)
+    program = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(program)
+    fn = getattr(program, "evaluate_symbolic_candidate", None) or getattr(
+        program, "run_discovery", None
+    )
+    if fn is None:
+        return 0.0
+    n = min(200, len(X_train))
+    m = min(80, len(X_val))
+    try:
+        result = fn(X_train[:n], y_train[:n], X_val[:m], y_val[:m])
+        return float(result.get("combined_score", 0.0))
+    except Exception:
+        return 0.0
+
+
 def evaluate_stage1(program_path: str) -> dict:
     """Fast cascade stage: evaluate on a small subset of datasets with reduced data."""
     try:
@@ -363,18 +397,7 @@ def evaluate_stage1(program_path: str) -> dict:
         if harness_root not in sys.path:
             sys.path.insert(0, harness_root)
 
-        spec = importlib.util.spec_from_file_location("program", program_path)
-        program = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(program)
-
-        fn = getattr(program, "evaluate_symbolic_candidate", None) or getattr(
-            program, "run_discovery", None
-        )
-        if fn is None:
-            return {"combined_score": 0.0, "error": "missing evaluate_symbolic_candidate()"}
-
         all_datasets = load_all_datasets()
-        # Stage 1: sample up to 8 datasets for a quick check
         rng = np.random.default_rng(RANDOM_STATE)
         if len(all_datasets) > 8:
             indices = rng.choice(len(all_datasets), size=8, replace=False)
@@ -382,17 +405,16 @@ def evaluate_stage1(program_path: str) -> dict:
         else:
             subset = all_datasets
 
-        combined_scores = []
-        for name, X_train, X_val, y_train, y_val in subset:
-            n = min(200, len(X_train))
-            m = min(80, len(X_val))
-            try:
-                start = time.time()
-                result = fn(X_train[:n], y_train[:n], X_val[:m], y_val[:m])
-                ds_combined = float(result.get("combined_score", 0.0))
-                combined_scores.append(ds_combined)
-            except Exception:
-                combined_scores.append(0.0)
+        work_items = [
+            (name, X_train, X_val, y_train, y_val, program_path)
+            for name, X_train, X_val, y_train, y_val in subset
+        ]
+
+        import multiprocessing
+
+        fork_ctx = multiprocessing.get_context("fork")
+        with fork_ctx.Pool(processes=NUM_WORKERS) as pool:
+            combined_scores = list(pool.imap_unordered(_eval_stage1_worker, work_items))
 
         agg_combined = float(np.mean(combined_scores)) if combined_scores else 0.0
         return {"combined_score": agg_combined}

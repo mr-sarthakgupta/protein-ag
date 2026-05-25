@@ -86,6 +86,16 @@ class AgenticGenerator:
                 logger.warning("Agent timed out at step %d", step)
                 break
 
+            remaining = cfg.max_steps - step - 1
+            if step > 0:
+                elapsed = time.time() - t0
+                time_left = max(0, cfg.overall_timeout - elapsed)
+                step_note = _build_step_note(step, cfg.max_steps, remaining, time_left)
+                if conversation and conversation[-1].get("role") == "user":
+                    conversation[-1]["content"] += f"\n\n{step_note}"
+                else:
+                    conversation.append({"role": "user", "content": step_note})
+
             if _context_chars(sys_prompt, conversation) > cfg.max_context_chars:
                 conversation.append(
                     {
@@ -584,6 +594,28 @@ def _record_responses_api_usage(response, model_name: str) -> None:
         cache_read_tokens=cache_read,
         model=model_name,
     )
+
+
+def _build_step_note(step: int, max_steps: int, remaining: int, time_left: float) -> str:
+    """Build a concise step-counter message with progressive urgency."""
+    time_str = f"{time_left:.0f}s" if time_left < 600 else f"{time_left / 60:.0f}min"
+    if remaining <= 2:
+        return (
+            f"[Step {step + 1}/{max_steps} | {remaining} turns left | {time_str} remaining] "
+            f"URGENT: You MUST output your final improved program NOW. "
+            f"Do NOT call any more tools. Respond with your complete solution code."
+        )
+    if remaining <= 5:
+        return (
+            f"[Step {step + 1}/{max_steps} | {remaining} turns left | {time_str} remaining] "
+            f"Time is running out. Finish your exploration and output your improved program."
+        )
+    if remaining <= 15:
+        return (
+            f"[Step {step + 1}/{max_steps} | {remaining} turns left | {time_str} remaining] "
+            f"Start wrapping up — you must output a complete improved program before your turns run out."
+        )
+    return f"[Step {step + 1}/{max_steps} | {remaining} turns left | {time_str} remaining]"
 
 
 def _err(msg: str) -> Dict[str, Any]:

@@ -114,13 +114,12 @@ def fit_expression_constants(
     constants = list(constants)
 
     if not constants:
-        fitted_expr = sp.simplify(template)
         return FittedExpression(
             expression_template=template,
-            expression=fitted_expr,
+            expression=template,
             constants={},
-            y_pred_train=_predict(fitted_expr, X_train, feature_names),
-            y_pred_val=_predict(fitted_expr, X_val, feature_names),
+            y_pred_train=_predict(template, X_train, feature_names),
+            y_pred_val=_predict(template, X_val, feature_names),
         )
 
     if initial_values is None:
@@ -130,16 +129,42 @@ def fit_expression_constants(
         if x0.size != len(constants):
             raise ValueError("initial_values must match the number of constants")
 
-    def residual(theta: NDArray) -> NDArray:
-        substitutions = {symbol: float(value) for symbol, value in zip(constants, theta)}
-        candidate = template.subs(substitutions)
-        try:
-            prediction = _predict(candidate, X_train, feature_names)
-        except Exception:
-            return np.full_like(y_train, 1e12, dtype=float)
-        if prediction.shape != y_train.shape or not np.all(np.isfinite(prediction)):
-            return np.full_like(y_train, 1e12, dtype=float)
-        return prediction - y_train
+    feature_syms = create_sympy_symbols(feature_names)
+    X_cols = [X_train[:, i] for i in range(X_train.shape[1])]
+
+    # Compile expression once upfront so the residual avoids repeated
+    # SymPy subs() + sympy2numpy() calls (the main bottleneck).
+    try:
+        _compiled = sp.lambdify(feature_syms + constants, template, modules=["numpy"])
+        _test_args = X_cols + [float(v) for v in x0]
+        _test_out = np.asarray(_compiled(*_test_args), dtype=float).reshape(-1)
+        if _test_out.shape != y_train.shape:
+            raise ValueError("shape mismatch")
+        _use_compiled = True
+    except Exception:
+        _use_compiled = False
+
+    if _use_compiled:
+        def residual(theta: NDArray) -> NDArray:
+            try:
+                args = X_cols + [float(v) for v in theta]
+                prediction = np.asarray(_compiled(*args), dtype=float).reshape(-1)
+            except Exception:
+                return np.full_like(y_train, 1e12, dtype=float)
+            if prediction.shape != y_train.shape or not np.all(np.isfinite(prediction)):
+                return np.full_like(y_train, 1e12, dtype=float)
+            return prediction - y_train
+    else:
+        def residual(theta: NDArray) -> NDArray:
+            substitutions = {symbol: float(value) for symbol, value in zip(constants, theta)}
+            candidate = template.subs(substitutions)
+            try:
+                prediction = _predict(candidate, X_train, feature_names)
+            except Exception:
+                return np.full_like(y_train, 1e12, dtype=float)
+            if prediction.shape != y_train.shape or not np.all(np.isfinite(prediction)):
+                return np.full_like(y_train, 1e12, dtype=float)
+            return prediction - y_train
 
     import warnings
 
@@ -155,7 +180,7 @@ def fit_expression_constants(
         str(symbol): float(value) for symbol, value in zip(constants, result.x)
     }
     substitutions = dict(zip(constants, result.x))
-    fitted_expr = sp.simplify(template.subs(substitutions))
+    fitted_expr = template.subs(substitutions)
 
     return FittedExpression(
         expression_template=template,
