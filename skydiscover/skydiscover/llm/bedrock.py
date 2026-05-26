@@ -48,6 +48,18 @@ def _region_from_api_base(api_base: Optional[str]) -> Optional[str]:
     return None
 
 
+def _prompt_cache_point() -> Optional[Dict[str, Any]]:
+    """Return a Bedrock Converse cache checkpoint, unless disabled by env."""
+    raw = os.environ.get("BEDROCK_PROMPT_CACHE_TTL", "1h").strip()
+    if raw.lower() in {"", "0", "false", "off", "none"}:
+        return None
+
+    cache_point: Dict[str, Any] = {"type": "default"}
+    if raw:
+        cache_point["ttl"] = raw
+    return {"cachePoint": cache_point}
+
+
 def _bedrock_api_key_from_aws_credentials(
     profile: Optional[str] = None,
     credentials_path: Optional[Path] = None,
@@ -210,7 +222,11 @@ class BedrockLLM(LLMInterface):
             "messages": bedrock_messages,
         }
         if system_message:
-            params["system"] = [{"text": system_message}]
+            system_blocks: list[dict[str, Any]] = [{"text": system_message}]
+            cache_point = _prompt_cache_point()
+            if cache_point:
+                system_blocks.append(cache_point)
+            params["system"] = system_blocks
         if inference_config:
             params["inferenceConfig"] = inference_config
         return params

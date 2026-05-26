@@ -338,11 +338,19 @@ class AgenticGenerator:
 
         bedrock_messages = _conv_to_bedrock(conversation)
         tool_config = _bedrock_tool_config()
+        cache_point = _bedrock_prompt_cache_point()
+        if cache_point:
+            tool_config["tools"].append(cache_point)
+            _add_bedrock_conversation_cache_point(bedrock_messages, cache_point)
 
         params: Dict[str, Any] = {
             "modelId": model.model,
             "messages": bedrock_messages,
-            "system": [{"text": system_message}],
+            "system": (
+                [{"text": system_message}, cache_point]
+                if cache_point
+                else [{"text": system_message}]
+            ),
             "toolConfig": tool_config,
         }
 
@@ -736,6 +744,38 @@ def _bedrock_tool_config() -> Dict[str, Any]:
             }
         })
     return {"tools": tools}
+
+
+def _bedrock_prompt_cache_point() -> Optional[Dict[str, Any]]:
+    """Return a Bedrock Converse cache checkpoint, unless disabled by env."""
+    raw = os.environ.get("BEDROCK_PROMPT_CACHE_TTL", "1h").strip()
+    if raw.lower() in {"", "0", "false", "off", "none"}:
+        return None
+
+    cache_point: Dict[str, Any] = {"type": "default"}
+    if raw:
+        cache_point["ttl"] = raw
+    return {"cachePoint": cache_point}
+
+
+def _add_bedrock_conversation_cache_point(
+    bedrock_messages: List[Dict[str, Any]],
+    cache_point: Dict[str, Any],
+) -> None:
+    """Mark the current conversation prefix for reuse by later agentic steps."""
+    if os.environ.get("BEDROCK_CACHE_CONVERSATION", "1").lower() in {
+        "0",
+        "false",
+        "off",
+        "none",
+    }:
+        return
+    if not bedrock_messages:
+        return
+
+    content = bedrock_messages[-1].setdefault("content", [])
+    if isinstance(content, list):
+        content.append(cache_point)
 
 
 def _conv_to_bedrock(conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

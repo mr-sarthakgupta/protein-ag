@@ -10,9 +10,7 @@ export AWS_REGION="${AWS_REGION:-us-east-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCHMARK_DIR="benchmarks/pysr_symbolic/disease_relevant_noninhibited_all"
-
-# Agentic mode: codebase root includes the harness library
-export BENCHMARK_CODEBASE_ROOT="$SCRIPT_DIR/benchmarks/pysr_symbolic"
+BENCHMARK_ROOT="$SCRIPT_DIR/benchmarks/pysr_symbolic"
 
 # ── Preflight checks ────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════════════╗"
@@ -25,7 +23,7 @@ echo "  Max iterations   : $ITERATIONS"
 echo "  Cost budget      : \$$MAX_COST"
 echo "  AWS region       : $AWS_REGION"
 echo "  Agentic mode     : ENABLED (with internet tools)"
-echo "  Codebase root    : $BENCHMARK_CODEBASE_ROOT"
+echo "  Benchmark root   : $BENCHMARK_ROOT"
 echo ""
 
 # Check Bedrock credentials
@@ -72,14 +70,25 @@ else
     exit 1
 fi
 
-# ── Create reference directory for internet tool downloads ───────────
-mkdir -p "$BENCHMARK_CODEBASE_ROOT/reference"
+# ── Prepare output dir; reference files are saved here directly ──────
+OUTPUT_DIR="${OUTPUT_DIR:-$(uv run python -c "
+from skydiscover.config import build_output_dir
+import os
+print(build_output_dir('${SEARCH}', os.path.abspath('${BENCHMARK_DIR}/initial_program.py')))
+")}"
+mkdir -p "$OUTPUT_DIR/reference"
+ln -sfn "$SCRIPT_DIR/benchmarks" "$OUTPUT_DIR/benchmarks"
+
+# Agentic tools read via benchmarks/ symlink; reference downloads land in OUTPUT_DIR/reference/
+export BENCHMARK_CODEBASE_ROOT="$OUTPUT_DIR"
 
 # ── Run the experiment ───────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════════"
 echo "  Starting discovery run (agentic + internet tools)"
 echo "  Finding universal equation across 60 amyloid datasets"
+echo "  Output directory : $OUTPUT_DIR"
+echo "  Reference files  : $OUTPUT_DIR/reference"
 echo "════════════════════════════════════════════════════════════"
 echo ""
 
@@ -89,18 +98,8 @@ uv run skydiscover-run \
     -c "$BENCHMARK_DIR/config.yaml" \
     -s "$SEARCH" \
     -i "$ITERATIONS" \
-    --max-cost "$MAX_COST"
-
-# ── Copy reference files to output for archival ──────────────────────
-REF_DIR="$BENCHMARK_CODEBASE_ROOT/reference"
-if [ -d "$REF_DIR" ] && [ "$(ls -A "$REF_DIR" 2>/dev/null)" ]; then
-    LATEST_OUTPUT=$(find outputs/ -maxdepth 4 -name "best_program_info.json" -printf '%T@ %h\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
-    if [ -n "${LATEST_OUTPUT:-}" ]; then
-        OUTPUT_ROOT="$(dirname "$LATEST_OUTPUT")"
-        cp -r "$REF_DIR" "$OUTPUT_ROOT/reference_files" 2>/dev/null && \
-            echo "Reference files copied to $OUTPUT_ROOT/reference_files" || true
-    fi
-fi
+    --max-cost "$MAX_COST" \
+    -o "$OUTPUT_DIR"
 
 echo ""
 echo "Done."

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
@@ -17,7 +18,8 @@ class CostLimitExceeded(RuntimeError):
 _BEDROCK_SONNET_46_PRICING = {
     "input": 3.0 / 1_000_000,
     "output": 15.0 / 1_000_000,
-    "cache_write": 3.75 / 1_000_000,  # 5-minute TTL cache writes
+    "cache_write_5m": 3.75 / 1_000_000,
+    "cache_write_1h": 6.0 / 1_000_000,
     "cache_read": 0.30 / 1_000_000,
 }
 
@@ -36,6 +38,13 @@ def _get_pricing(model: str) -> dict[str, float]:
         if key in model:
             return pricing
     return _DEFAULT_PRICING
+
+
+def _cache_write_price(pricing: dict[str, float]) -> float:
+    ttl = os.environ.get("BEDROCK_PROMPT_CACHE_TTL", "1h").strip().lower()
+    if ttl == "1h":
+        return pricing.get("cache_write_1h", 6.0 / 1_000_000)
+    return pricing.get("cache_write_5m", 3.75 / 1_000_000)
 
 
 class CostTracker:
@@ -69,7 +78,7 @@ class CostTracker:
             regular_input * pricing["input"]
             + output_tokens * pricing["output"]
             + cache_read_tokens * pricing["cache_read"]
-            + cache_write_tokens * pricing["cache_write"]
+            + cache_write_tokens * _cache_write_price(pricing)
         )
 
         with self._lock:

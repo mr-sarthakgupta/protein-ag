@@ -8,6 +8,7 @@ per dataset), and returns an aggregate score.
 from __future__ import annotations
 
 import csv
+import concurrent.futures
 import importlib.util
 import os
 import pickle
@@ -173,7 +174,7 @@ def load_all_datasets(
     return results
 
 
-NUM_WORKERS = min(8, os.cpu_count() or 4)
+NUM_WORKERS = int(os.environ.get("SKYDISCOVER_EVAL_WORKERS", min(8, os.cpu_count() or 4)))
 
 
 def evaluate_candidate_with_timeout(program_path: str, timeout_seconds: int = 3000) -> dict:
@@ -189,11 +190,11 @@ def evaluate_candidate_with_timeout(program_path: str, timeout_seconds: int = 30
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as temp_file:
         script = f"""
 import importlib.util
-import multiprocessing
 import os
 import pickle
 import sys
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -206,7 +207,16 @@ sys.path.insert(0, {harness_root!r})
 program_path = {program_path!r}
 evaluator_path = {evaluator_path!r}
 results_path = {temp_file.name + ".results"!r}
-NUM_WORKERS = min(8, os.cpu_count() or 4)
+NUM_WORKERS = int(os.environ.get("SKYDISCOVER_EVAL_WORKERS", min(8, os.cpu_count() or 4)))
+
+def _write_payload_and_exit(payload):
+    with open(results_path, "wb") as f:
+        pickle.dump(payload, f)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # PySR/PythonCall can leave Julia runtime threads/finalizers alive at
+    # interpreter shutdown. The parent only needs the pickle payload.
+    os._exit(0)
 
 try:
     evaluator_spec = importlib.util.spec_from_file_location("benchmark_evaluator", evaluator_path)
@@ -245,9 +255,10 @@ try:
             }}
 
     per_dataset_results = {{}}
-    _fork_ctx = multiprocessing.get_context("fork")
-    with _fork_ctx.Pool(processes=NUM_WORKERS) as pool:
-        for ds_name, ds_result in pool.imap_unordered(_eval_one, datasets):
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = [executor.submit(_eval_one, dataset) for dataset in datasets]
+        for future in as_completed(futures):
+            ds_name, ds_result = future.result()
             per_dataset_results[ds_name] = ds_result
 
     combined_scores = [r["combined_score"] for r in per_dataset_results.values()]
@@ -271,12 +282,10 @@ try:
         "per_dataset": per_dataset_results,
     }}
 
-    with open(results_path, "wb") as f:
-        pickle.dump({{"result": aggregated}}, f)
+    _write_payload_and_exit({{"result": aggregated}})
 except Exception as exc:
     traceback.print_exc()
-    with open(results_path, "wb") as f:
-        pickle.dump({{"error": str(exc)}}, f)
+    _write_payload_and_exit({{"error": str(exc)}})
 """
         temp_file.write(script.encode())
         temp_path = temp_file.name
@@ -410,11 +419,9 @@ def evaluate_stage1(program_path: str) -> dict:
             for name, X_train, X_val, y_train, y_val in subset
         ]
 
-        import multiprocessing
-
-        fork_ctx = multiprocessing.get_context("fork")
-        with fork_ctx.Pool(processes=NUM_WORKERS) as pool:
-            combined_scores = list(pool.imap_unordered(_eval_stage1_worker, work_items))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+            futures = [executor.submit(_eval_stage1_worker, item) for item in work_items]
+            combined_scores = [future.result() for future in concurrent.futures.as_completed(futures)]
 
         agg_combined = float(np.mean(combined_scores)) if combined_scores else 0.0
         return {"combined_score": agg_combined}
