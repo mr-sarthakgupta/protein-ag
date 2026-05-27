@@ -6,7 +6,11 @@ MAX_COST="${MAX_COST:-10}"
 ITERATIONS="${ITERATIONS:-50}"
 SEARCH="${SEARCH:-adaevolve}"  # supported: adaevolve, evox
 ALLOW_SMOKE_FAIL="${ALLOW_SMOKE_FAIL:-0}"
-export AWS_REGION="${AWS_REGION:-us-east-1}"
+# Keep Bedrock calls pinned to the repo-standard region.
+AWS_REGION="us-east-1"
+export AWS_REGION
+export AWS_DEFAULT_REGION="$AWS_REGION"
+export BEDROCK_AWS_REGION="$AWS_REGION"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCHMARK_DIR="benchmarks/pysr_symbolic/alphasyn_gaspar2017_03um_seed_all"

@@ -7,6 +7,7 @@ per dataset), and returns an aggregate score.
 
 from __future__ import annotations
 
+import ast
 import csv
 import concurrent.futures
 import importlib.util
@@ -43,6 +44,175 @@ combined_score_from_nmse = _metrics_mod.combined_score_from_nmse
 DATA_ROOT = Path("/home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited")
 RANDOM_STATE = 42
 TEST_SIZE = 0.25
+SINGLE_EQUATION_ERROR_PREFIX = "Single-equation violation"
+_ALLOWED_IMPORTS = {"sympy", "numpy"}
+_ALLOWED_FROM_IMPORTS = {
+    "__future__",
+    "typing",
+    "numpy.typing",
+    "pysr_harness.equation_session",
+}
+_ALLOWED_HARNESS_IMPORTS = {
+    "constant_symbols",
+    "evaluate_expression",
+    "feature_symbols",
+}
+_ALLOWED_EVALUATE_CALLS = {
+    "constant_symbols",
+    "evaluate_expression",
+    "feature_symbols",
+    "sp.exp",
+    "sp.log",
+    "sp.log1p",
+    "sp.sqrt",
+    "sp.sin",
+    "sp.cos",
+    "sp.tan",
+    "sp.tanh",
+    "sp.sinh",
+    "sp.cosh",
+}
+_PROTECTED_NAMES = {
+    "constant_symbols",
+    "evaluate_expression",
+    "feature_symbols",
+    "single_equation_evaluation",
+    "validate_single_equation_result",
+}
+_DISALLOWED_CONTROL_NODES = (
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.For,
+    ast.While,
+    ast.If,
+    ast.IfExp,
+    ast.Try,
+    ast.With,
+    ast.AsyncWith,
+    ast.Match,
+    ast.Lambda,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
+
+def _call_name(func: ast.AST) -> str:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return f"{func.value.id}.{func.attr}"
+    return ""
+
+
+def _assigned_names(target: ast.AST) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for elt in target.elts:
+            names.update(_assigned_names(elt))
+        return names
+    return set()
+
+
+def validate_candidate_source(program_path: str) -> None:
+    """Reject reward-hacking program structure before importing candidate code."""
+    source = Path(program_path).read_text()
+    tree = ast.parse(source, filename=program_path)
+
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in _ALLOWED_IMPORTS:
+                    raise ValueError(
+                        f"{SINGLE_EQUATION_ERROR_PREFIX}: import '{alias.name}' is not allowed. "
+                        "Candidates may only import sympy/numpy and the equation harness."
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module not in _ALLOWED_FROM_IMPORTS:
+                raise ValueError(
+                    f"{SINGLE_EQUATION_ERROR_PREFIX}: from-import '{module}' is not allowed."
+                )
+            if module == "pysr_harness.equation_session":
+                imported = {alias.name for alias in node.names}
+                extra = imported - _ALLOWED_HARNESS_IMPORTS
+                if extra:
+                    raise ValueError(
+                        f"{SINGLE_EQUATION_ERROR_PREFIX}: unsupported harness imports "
+                        f"{sorted(extra)}. Use only feature_symbols, constant_symbols, "
+                        "and evaluate_expression."
+                    )
+
+    eval_fns = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "evaluate_symbolic_candidate"
+    ]
+    if len(eval_fns) != 1:
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: program must define exactly one "
+            "evaluate_symbolic_candidate() function."
+        )
+    fn = eval_fns[0]
+
+    returns = [node for node in ast.walk(fn) if isinstance(node, ast.Return)]
+    if len(returns) != 1:
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: evaluate_symbolic_candidate() must have "
+            "exactly one return statement."
+        )
+    return_value = returns[0].value
+    if not (
+        isinstance(return_value, ast.Call)
+        and isinstance(return_value.func, ast.Name)
+        and return_value.func.id == "evaluate_expression"
+    ):
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: evaluate_symbolic_candidate() must directly "
+            "return evaluate_expression(...), with no wrapper or post-processing."
+        )
+
+    evaluate_calls = 0
+    for node in ast.walk(fn):
+        if isinstance(node, _DISALLOWED_CONTROL_NODES):
+            raise ValueError(
+                f"{SINGLE_EQUATION_ERROR_PREFIX}: control flow, nested definitions, "
+                "comprehensions, and conditionals are not allowed inside "
+                "evaluate_symbolic_candidate(). Build one straight-line equation."
+            )
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise ValueError(
+                f"{SINGLE_EQUATION_ERROR_PREFIX}: imports are not allowed inside "
+                "evaluate_symbolic_candidate()."
+            )
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            assigned = set().union(*(_assigned_names(target) for target in targets))
+            protected = assigned & _PROTECTED_NAMES
+            if protected:
+                raise ValueError(
+                    f"{SINGLE_EQUATION_ERROR_PREFIX}: cannot reassign protected scorer "
+                    f"or harness names {sorted(protected)}."
+                )
+        if isinstance(node, ast.Call):
+            name = _call_name(node.func)
+            if name == "evaluate_expression":
+                evaluate_calls += 1
+            if name not in _ALLOWED_EVALUATE_CALLS:
+                raise ValueError(
+                    f"{SINGLE_EQUATION_ERROR_PREFIX}: call '{name or type(node.func).__name__}' "
+                    "is not allowed inside evaluate_symbolic_candidate(). Allowed calls "
+                    "are the symbol helpers, evaluate_expression, and basic sp.* math."
+                )
+
+    if evaluate_calls != 1:
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: evaluate_symbolic_candidate() must call "
+            f"evaluate_expression() exactly once; found {evaluate_calls} calls."
+        )
 
 
 def _parse_parameter_from_column(column_name: str) -> float | None:
@@ -185,6 +355,7 @@ def evaluate_candidate_with_timeout(program_path: str, timeout_seconds: int = 30
     constants each time) using parallel threads, and returns aggregated
     metrics.
     """
+    validate_candidate_source(program_path)
     harness_root = str(BENCHMARK_ROOT)
     evaluator_path = str(Path(__file__).resolve())
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as temp_file:
@@ -222,10 +393,15 @@ try:
     evaluator_spec = importlib.util.spec_from_file_location("benchmark_evaluator", evaluator_path)
     evaluator = importlib.util.module_from_spec(evaluator_spec)
     evaluator_spec.loader.exec_module(evaluator)
+    evaluator.validate_candidate_source(program_path)
 
     spec = importlib.util.spec_from_file_location("program", program_path)
     program = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(program)
+    from pysr_harness.equation_session import (
+        single_equation_evaluation,
+        validate_single_equation_result,
+    )
 
     fn = getattr(program, "evaluate_symbolic_candidate", None) or getattr(
         program, "run_discovery", None
@@ -238,13 +414,16 @@ try:
     def _eval_one(args):
         ds_name, X_train, X_val, y_train, y_val = args
         try:
-            result = fn(X_train, y_train, X_val, y_val)
+            with single_equation_evaluation():
+                result = fn(X_train, y_train, X_val, y_val)
+                validate_single_equation_result(result)
             ds_nmse = float(result.get("nmse_val", float("inf")))
             ds_combined = float(result.get("combined_score", 0.0))
             return ds_name, {{
                 "nmse_val": ds_nmse,
                 "combined_score": ds_combined,
                 "equation": str(result.get("equation", "")),
+                "equation_template": str(result.get("equation_template", "")),
                 "constants": result.get("constants", {{}}),
             }}
         except Exception as exc:
@@ -267,20 +446,49 @@ try:
     agg_nmse = float(np.mean(finite_nmse)) if finite_nmse else float("inf")
     agg_combined = float(1.0 / (1.0 + max(agg_nmse, 0.0))) if np.isfinite(agg_nmse) else 0.0
 
+    violation_errors = sorted(
+        {{
+            str(r.get("error"))
+            for r in per_dataset_results.values()
+            if r.get("error") and evaluator.SINGLE_EQUATION_ERROR_PREFIX in str(r.get("error"))
+        }}
+    )
+    templates = sorted(
+        {{
+            str(r.get("equation_template"))
+            for r in per_dataset_results.values()
+            if r.get("combined_score", 0.0) > 0 and r.get("equation_template")
+        }}
+    )
+
     eq_template = ""
     for r in per_dataset_results.values():
         if r.get("equation"):
             eq_template = r["equation"]
             break
 
+    violation_error = None
+    if violation_errors:
+        violation_error = violation_errors[0]
+    elif len(templates) > 1:
+        examples = "; ".join(templates[:3])
+        violation_error = (
+            "Single-equation violation: evaluate_symbolic_candidate() produced "
+            f"{{len(templates)}} distinct equation templates across datasets. "
+            "The base equation must be identical for all datasets; only fitted "
+            f"constants may vary. Example templates: {{examples}}"
+        )
+
     aggregated = {{
         "equation": eq_template,
-        "nmse_val": agg_nmse,
-        "combined_score": agg_combined,
+        "nmse_val": float("inf") if violation_error else agg_nmse,
+        "combined_score": 0.0 if violation_error else agg_combined,
         "n_datasets": len(datasets),
-        "n_successful": sum(1 for s in combined_scores if s > 0),
+        "n_successful": 0 if violation_error else sum(1 for s in combined_scores if s > 0),
         "per_dataset": per_dataset_results,
     }}
+    if violation_error:
+        aggregated["error"] = violation_error
 
     _write_payload_and_exit({{"result": aggregated}})
 except Exception as exc:
@@ -339,6 +547,7 @@ def _metrics_from_result(result: dict, eval_time: float) -> dict:
         "n_datasets": result.get("n_datasets", 0),
         "n_successful": result.get("n_successful", 0),
         "per_dataset": result.get("per_dataset", {}),
+        "error": str(result.get("error", "")),
     }
 
 
@@ -357,6 +566,8 @@ def evaluate(program_path: str) -> dict:
             f"time={metrics['eval_time']:.2f}s"
         )
         print(f"Equation template: {metrics['equation']}")
+        if metrics.get("error"):
+            print(f"Evaluator feedback: {metrics['error']}")
         return metrics
     except Exception as exc:
         print(f"Evaluation failed: {exc}")
@@ -382,21 +593,29 @@ def _eval_stage1_worker(args):
     harness_root = str(BENCHMARK_ROOT)
     if harness_root not in sys.path:
         sys.path.insert(0, harness_root)
+    validate_candidate_source(program_path)
     spec = importlib.util.spec_from_file_location("program", program_path)
     program = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(program)
+    from pysr_harness.equation_session import (
+        single_equation_evaluation,
+        validate_single_equation_result,
+    )
+
     fn = getattr(program, "evaluate_symbolic_candidate", None) or getattr(
         program, "run_discovery", None
     )
     if fn is None:
-        return 0.0
+        return 0.0, "missing evaluate_symbolic_candidate()"
     n = min(200, len(X_train))
     m = min(80, len(X_val))
     try:
-        result = fn(X_train[:n], y_train[:n], X_val[:m], y_val[:m])
-        return float(result.get("combined_score", 0.0))
-    except Exception:
-        return 0.0
+        with single_equation_evaluation():
+            result = fn(X_train[:n], y_train[:n], X_val[:m], y_val[:m])
+            validate_single_equation_result(result)
+        return float(result.get("combined_score", 0.0)), None
+    except Exception as exc:
+        return 0.0, str(exc)
 
 
 def evaluate_stage1(program_path: str) -> dict:
@@ -421,8 +640,18 @@ def evaluate_stage1(program_path: str) -> dict:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
             futures = [executor.submit(_eval_stage1_worker, item) for item in work_items]
-            combined_scores = [future.result() for future in concurrent.futures.as_completed(futures)]
+            worker_results = [future.result() for future in concurrent.futures.as_completed(futures)]
 
+        combined_scores = [score for score, _error in worker_results]
+        violation_errors = sorted(
+            {
+                error
+                for _score, error in worker_results
+                if error and SINGLE_EQUATION_ERROR_PREFIX in error
+            }
+        )
+        if violation_errors:
+            return {"combined_score": 0.0, "error": violation_errors[0]}
         agg_combined = float(np.mean(combined_scores)) if combined_scores else 0.0
         return {"combined_score": agg_combined}
     except Exception as exc:

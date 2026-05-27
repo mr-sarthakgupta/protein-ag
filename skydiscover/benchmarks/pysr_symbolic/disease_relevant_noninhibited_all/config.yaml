@@ -13,10 +13,12 @@ llm:
   models:
     - name: "us.anthropic.claude-sonnet-4-6"
       weight: 1.0
-  api_base: "bedrock:"
+  api_base: "bedrock:us-east-1"
   temperature: 0.7
   max_tokens: 60000
-  timeout: 600
+  timeout: 1800
+  retries: 2
+  retry_delay: 10
 
 prompt:
   system_message: |
@@ -41,16 +43,54 @@ prompt:
     each dataset. This means the equation captures the universal kinetic
     mechanism while constants adapt to each protein system's specific rates.
 
+    **Hard single-equation rule:** Your EVOLVE-BLOCK must build exactly one
+    symbolic expression template and submit it exactly once via
+    `evaluate_expression(...)` from inside `evaluate_symbolic_candidate()`.
+    Do not try several equations, several template families, fallback equations,
+    helper functions that call the scorer repeatedly, multiple initial-value
+    sweeps, or "best-of" selection logic. That is reward hacking for this task.
+    The evaluator will reject these programs with combined_score = 0 and return
+    a "Single-equation violation" error so you can correct it. You may use
+    intermediate subexpressions like `rate`, `half_time`, `plateau`, and
+    `baseline`, but there must be one final `expression` and one scorer call.
+    Return the dictionary from that single `evaluate_expression(...)` call
+    directly and unchanged. Do not edit, wrap, replace, or fabricate metrics.
+    The evaluator statically checks your source before importing it: the
+    function must be straight-line code and must directly end with
+    `return evaluate_expression(...)`.
+
     ## Focused agentic workflow
     Keep exploration short and bounded. You already know the benchmark layout,
     evaluator contract, and `pysr_harness` API from this prompt; do not spend
     many turns rediscovering them.
 
-    Use at most 2-3 tool calls before producing code. Prefer targeted commands
-    that print compact summaries. Do not dump full source files, full dataset
-    listings, long per-dataset tables, or warning-heavy experiment transcripts
-    into the conversation. If you test a model, test only a small representative
-    subset and print only aggregate metrics plus the few hardest cases.
+    Use at most 1-2 tool calls before producing code. Tool calls are expensive:
+    they add latency, increase future prompt size, and can fail. Prefer no tools
+    when the prompt already contains enough information.
+
+    Before every `run_command`, silently do this checklist:
+    - Expected runtime under 10 seconds?
+    - Expected output under 80 lines?
+    - Uses only a known path from the prompt/repo map?
+    - Avoids shell-only syntax?
+    If any answer is "no", do not run the command.
+
+    Never run filesystem discovery commands (`find`, broad `ls`, recursive
+    scans, `/`, `/home`, `/usr`, `/opt`, or whole-repo searches). Never use
+    shell metacharacters in safe-mode commands: no pipes (`|`), redirects
+    (`>`, `2>/dev/null`), command chaining (`&&`, `;`), globs intended for the
+    shell, or `head`/`tail` pipelines. Use only short Python snippets over known
+    files, with explicit bounded printing.
+
+    Do not dump full source files, full dataset listings, long per-dataset
+    tables, or warning-heavy experiment transcripts into the conversation. If
+    you test a model, test at most 3 representative datasets and print only one
+    aggregate score plus at most 3 hard-case lines.
+
+    If `read_file` says a path is outside the codebase root, do not spend more
+    tool calls trying to rediscover that file. Use the API description in this
+    prompt and output a complete candidate. Failed exploration is a signal to
+    stop exploring, not to search more broadly.
 
     Stop exploring once you have a plausible improvement. Output the complete
     improved EVOLVE-BLOCK program instead of running many variants. Repeated
@@ -88,7 +128,22 @@ prompt:
     overfitting on small datasets; too few risk underfitting complex kinetics.
 
     ## Constraints
+    - Exactly one call to `evaluate_expression(...)` per
+      `evaluate_symbolic_candidate()` invocation.
+    - Directly `return evaluate_expression(...)`; do not assign the result to a
+      variable, edit it, wrap it, or post-process it.
+    - The `equation_template` returned by the scorer must be identical for every
+      dataset; only fitted constant values may differ across datasets.
+    - Keep `evaluate_symbolic_candidate()` straight-line: no loops, conditionals,
+      try/except blocks, nested functions/classes, comprehensions, helper
+      function calls, or imports inside the function.
+    - Do not use `Piecewise`, `Max`, `Min`, `sign`, `floor`, `ceiling`,
+      `Heaviside`, relational/boolean expressions, or other gated/conditional
+      symbolic constructs.
+    - Keep symbolic complexity under 160 nodes and fitted constants under 13.
     - Do NOT call PySRRegressor.fit, run_gp_session, or equation_search.
+    - Do NOT implement multiple candidate templates and choose the one with the
+      lowest loss.
     - Keep expressions numerically stable and general.
     - Do not hardcode data values or indices.
     - The evaluator scores mean validation NMSE across all datasets;
@@ -99,7 +154,7 @@ search:
   share_llm: true
 
 evaluator:
-  timeout: 3000
+  timeout: 7200
   cascade_evaluation: true
   cascade_thresholds:
     - 0.15
@@ -108,13 +163,15 @@ evaluator:
 agentic:
   enabled: true
   codebase_root: "${BENCHMARK_CODEBASE_ROOT}"
-  max_steps: 16
-  per_step_timeout: 300.0
-  overall_timeout: 2400.0
-  max_context_chars: 800000
-  max_file_chars: 20000
-  max_files_read: 12
-  run_command_max_output_chars: 8000
+  max_steps: 10
+  per_step_timeout: 5700.0
+  overall_timeout: 14400.0
+  max_context_chars: 400000000
+  max_file_chars: 2000000
+  max_files_read: 8
+  run_command_default_timeout: 120
+  run_command_max_timeout: 300
+  run_command_max_output_chars: 4000
   allowed_extensions:
     - ".py"
     - ".txt"

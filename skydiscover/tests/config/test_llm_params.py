@@ -75,16 +75,16 @@ class TestApiBaseRouting:
         assert cfg.models[0].name == "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
         assert cfg.models[0].api_base == "bedrock"
 
-    def test_bedrock_model_preserves_region_override(self):
+    def test_bedrock_model_preserves_explicit_us_east_1_region(self):
         cfg = LLMConfig(
-            api_base="bedrock:us-west-2",
+            api_base="bedrock:us-east-1",
             models=[
                 LLMModelConfig(
                     name="bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
                 )
             ],
         )
-        assert cfg.models[0].api_base == "bedrock:us-west-2"
+        assert cfg.models[0].api_base == "bedrock:us-east-1"
 
     def test_bedrock_does_not_fall_back_to_openai_key(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "openai-key")

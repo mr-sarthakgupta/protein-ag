@@ -132,6 +132,7 @@ class BedrockLLM(LLMInterface):
 
         try:
             import boto3
+            from botocore.config import Config as BotoConfig
         except ImportError as exc:
             raise ImportError(
                 "AWS Bedrock support requires boto3. Install with "
@@ -144,7 +145,16 @@ class BedrockLLM(LLMInterface):
             session_kwargs["profile_name"] = profile
         _ensure_bedrock_bearer_token(profile)
         session = boto3.Session(**session_kwargs)
-        self.client = session.client("bedrock-runtime", region_name=self.region)
+        client_config = BotoConfig(
+            connect_timeout=int(os.environ.get("BEDROCK_CONNECT_TIMEOUT", "10")),
+            read_timeout=int(os.environ.get("BEDROCK_READ_TIMEOUT", self.timeout or 300)),
+            retries={"mode": "standard", "total_max_attempts": 1},
+        )
+        self.client = session.client(
+            "bedrock-runtime",
+            region_name=self.region,
+            config=client_config,
+        )
 
         if not hasattr(logger, "_initialized_models"):
             logger._initialized_models = set()

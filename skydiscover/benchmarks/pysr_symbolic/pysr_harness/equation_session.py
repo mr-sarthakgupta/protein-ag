@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import copy
+from contextlib import contextmanager
 from dataclasses import dataclass
+import os
+import threading
 from typing import Any, Sequence
 
 import numpy as np
 import sympy as sp
+from sympy.core.relational import Relational
+from sympy.logic.boolalg import BooleanFunction
 from numpy.typing import NDArray
 from pysr.export_numpy import CallableEquation, sympy2numpy
 from pysr.export_sympy import create_sympy_symbols, pysr2sympy, sympy_mappings
@@ -20,6 +26,29 @@ from pysr_harness.operators import (
 )
 
 
+class SingleEquationViolation(RuntimeError):
+    """Raised when a candidate tries to score more than one equation template."""
+
+
+MAX_EQUATION_COMPLEXITY = int(os.environ.get("SKYDISCOVER_MAX_EQUATION_COMPLEXITY", "160"))
+MAX_EQUATION_CONSTANTS = int(os.environ.get("SKYDISCOVER_MAX_EQUATION_CONSTANTS", "12"))
+_BANNED_EXPR_TYPES = (
+    sp.Piecewise,
+    Relational,
+    BooleanFunction,
+    sp.Heaviside,
+    sp.DiracDelta,
+)
+_BANNED_EXPR_FUNCTIONS = {
+    "Max",
+    "Min",
+    "sign",
+    "floor",
+    "ceiling",
+    "Mod",
+}
+
+
 @dataclass(frozen=True)
 class FittedExpression:
     """A fitted symbolic expression and its validation predictions."""
@@ -29,6 +58,99 @@ class FittedExpression:
     constants: dict[str, float]
     y_pred_train: NDArray
     y_pred_val: NDArray
+
+
+@dataclass
+class _SingleEquationState:
+    calls: int = 0
+    template_fingerprint: str | None = None
+    result_snapshot: dict[str, Any] | None = None
+
+
+_SINGLE_EQUATION_STATE = threading.local()
+
+
+@contextmanager
+def single_equation_evaluation():
+    """
+    Enforce the benchmark contract for one evaluate_symbolic_candidate() call.
+
+    A candidate may build helper subexpressions, but it may submit exactly one
+    symbolic template to the scorer. This prevents reward hacking where a
+    program tries many equations and returns whichever receives the best score.
+    """
+    previous = getattr(_SINGLE_EQUATION_STATE, "state", None)
+    state = _SingleEquationState()
+    _SINGLE_EQUATION_STATE.state = state
+    try:
+        yield
+        if state.calls != 1:
+            raise SingleEquationViolation(
+                "Single-equation violation: evaluate_symbolic_candidate() must call "
+                "evaluate_expression() exactly once with one symbolic equation template. "
+                f"It submitted {state.calls} templates. Build one base equation and let "
+                "the harness fit that equation's constants per dataset."
+            )
+    finally:
+        _SINGLE_EQUATION_STATE.state = previous
+
+
+def _record_scored_template(template: sp.Expr) -> None:
+    state = getattr(_SINGLE_EQUATION_STATE, "state", None)
+    if state is None:
+        return
+
+    state.calls += 1
+    fingerprint = sp.srepr(template)
+    if state.template_fingerprint is None:
+        state.template_fingerprint = fingerprint
+        return
+
+    if state.template_fingerprint != fingerprint:
+        raise SingleEquationViolation(
+            "Single-equation violation: one evaluate_symbolic_candidate() call "
+            "submitted multiple different symbolic equation templates. The base "
+            "equation must be fixed; only fitted constants may change."
+        )
+
+    raise SingleEquationViolation(
+        "Single-equation violation: evaluate_symbolic_candidate() called "
+        "evaluate_expression()/fit_expression_constants() more than once. Do not "
+        "try multiple equation templates or multiple scorer calls and pick the "
+        "best result; submit exactly one symbolic expression."
+    )
+
+
+def _record_scorer_result(result: dict[str, Any]) -> None:
+    state = getattr(_SINGLE_EQUATION_STATE, "state", None)
+    if state is not None:
+        state.result_snapshot = copy.deepcopy(result)
+
+
+def validate_single_equation_result(result: Any) -> None:
+    """
+    Ensure the candidate returns the actual scorer output, unchanged.
+
+    This closes the loophole where a program calls evaluate_expression() once
+    to satisfy the call-count guard, then fabricates or edits the metrics it
+    returns to the evaluator.
+    """
+    state = getattr(_SINGLE_EQUATION_STATE, "state", None)
+    if state is None:
+        return
+
+    if state.result_snapshot is None:
+        raise SingleEquationViolation(
+            "Single-equation violation: evaluate_symbolic_candidate() must return "
+            "the dictionary produced by evaluate_expression()."
+        )
+
+    if result != state.result_snapshot:
+        raise SingleEquationViolation(
+            "Single-equation violation: evaluate_symbolic_candidate() must return "
+            "the exact, unmodified result from its single evaluate_expression() "
+            "call. Do not fabricate, overwrite, wrap, or post-process metrics."
+        )
 
 
 def feature_symbols(n_features: int) -> list[sp.Symbol]:
@@ -75,6 +197,31 @@ def _complexity(expression: sp.Expr) -> float:
     return float(sum(1 for _ in sp.preorder_traversal(expression)))
 
 
+def _validate_expression_template(template: sp.Expr, constants: Sequence[sp.Symbol]) -> None:
+    complexity = int(_complexity(template))
+    if complexity > MAX_EQUATION_COMPLEXITY:
+        raise SingleEquationViolation(
+            "Single-equation violation: symbolic template is too complex "
+            f"({complexity} nodes > limit {MAX_EQUATION_COMPLEXITY}). Do not hide "
+            "many candidate equations inside one oversized expression."
+        )
+
+    if len(constants) > MAX_EQUATION_CONSTANTS:
+        raise SingleEquationViolation(
+            "Single-equation violation: too many fitted constants "
+            f"({len(constants)} > limit {MAX_EQUATION_CONSTANTS}). Use one compact "
+            "universal equation, not an over-parameterized surrogate."
+        )
+
+    for node in sp.preorder_traversal(template):
+        if isinstance(node, _BANNED_EXPR_TYPES) or node.func.__name__ in _BANNED_EXPR_FUNCTIONS:
+            raise SingleEquationViolation(
+                "Single-equation violation: conditional, piecewise, discontinuous, "
+                f"or gated symbolic construct '{node.func.__name__}' is not allowed. "
+                "Use one smooth global equation template."
+            )
+
+
 def _predict(expression: sp.Expr, X: NDArray, feature_names: Sequence[str]) -> NDArray:
     symbols = create_sympy_symbols(feature_names)
     fn = sympy2numpy(expression, symbols)
@@ -107,11 +254,13 @@ def fit_expression_constants(
     X_val = np.asarray(X_val, dtype=float)
     feature_names = [f"x{i}" for i in range(X_train.shape[1])]
     template = _as_sympy_expr(expression, feature_names)
+    _record_scored_template(template)
 
     if constants is None:
         feature_set = set(feature_symbols(X_train.shape[1]))
         constants = sorted(template.free_symbols - feature_set, key=lambda s: s.name)
     constants = list(constants)
+    _validate_expression_template(template, constants)
 
     if not constants:
         return FittedExpression(
@@ -218,7 +367,7 @@ def evaluate_expression(
     nmse_val = nmse(y_val, fitted.y_pred_val)
     loss = float(np.mean((fitted.y_pred_train - y_train) ** 2))
 
-    return {
+    result = {
         "equation_template": str(fitted.expression_template),
         "equation": str(fitted.expression),
         "constants": fitted.constants,
@@ -228,3 +377,5 @@ def evaluate_expression(
         "nmse_val": nmse_val,
         "combined_score": combined_score_from_nmse(nmse_val),
     }
+    _record_scorer_result(result)
+    return result

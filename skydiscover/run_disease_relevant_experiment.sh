@@ -6,7 +6,13 @@ MAX_COST="${MAX_COST:-50}"
 ITERATIONS="${ITERATIONS:-30}"
 SEARCH="${SEARCH:-adaevolve}"  # supported: adaevolve, evox
 ALLOW_SMOKE_FAIL="${ALLOW_SMOKE_FAIL:-0}"
-export AWS_REGION="${AWS_REGION:-us-east-1}"
+# Keep Bedrock calls pinned to the repo-standard region.
+AWS_REGION="us-east-1"
+export AWS_REGION
+export AWS_DEFAULT_REGION="$AWS_REGION"
+export BEDROCK_AWS_REGION="$AWS_REGION"
+export BEDROCK_CONNECT_TIMEOUT="${BEDROCK_CONNECT_TIMEOUT:-30}"
+export BEDROCK_READ_TIMEOUT="${BEDROCK_READ_TIMEOUT:-1800}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCHMARK_DIR="benchmarks/pysr_symbolic/disease_relevant_noninhibited_all"
@@ -77,10 +83,9 @@ import os
 print(build_output_dir('${SEARCH}', os.path.abspath('${BENCHMARK_DIR}/initial_program.py')))
 ")}"
 mkdir -p "$OUTPUT_DIR/reference"
-ln -sfn "$SCRIPT_DIR/benchmarks" "$OUTPUT_DIR/benchmarks"
 
-# Agentic tools read via benchmarks/ symlink; reference downloads land in OUTPUT_DIR/reference/
-export BENCHMARK_CODEBASE_ROOT="$OUTPUT_DIR"
+# Agentic path validation resolves symlinks, so use the real benchmark tree.
+export BENCHMARK_CODEBASE_ROOT="$BENCHMARK_ROOT"
 
 # ── Run the experiment ───────────────────────────────────────────────
 echo ""
