@@ -96,7 +96,16 @@ class DiscoveryController:
         if self.config.agentic.enabled:
             from skydiscover.llm.agentic_generator import AgenticGenerator
 
-            self.agentic_generator = AgenticGenerator(self.llms, self.config.agentic)
+            trace_dir = (
+                os.path.join(self.output_dir, "reference")
+                if self.output_dir
+                else None
+            )
+            self.agentic_generator = AgenticGenerator(
+                self.llms,
+                self.config.agentic,
+                trace_dir=trace_dir,
+            )
             logger.info(f"Agentic mode enabled (codebase: {self.config.agentic.codebase_root})")
 
         self.num_context_programs = controller_input.config.search.num_context_programs

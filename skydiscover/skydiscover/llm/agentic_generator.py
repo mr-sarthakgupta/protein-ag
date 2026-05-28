@@ -20,10 +20,16 @@ from skydiscover.utils.code_utils import build_repo_map
 
 logger = logging.getLogger(__name__)
 _agentic_log = logging.getLogger("skydiscover.agentic_trace")
+EXTERNAL_RESEARCH_TOOLS = {"web_search", "research_papers", "hf_papers", "fetch_webpage"}
 
 _TOOL_SCHEMAS_PATH = Path(__file__).parent / "tool_schemas" / "agentic_tools.json"
 with open(_TOOL_SCHEMAS_PATH, "r") as _f:
     TOOL_SCHEMAS = json.load(_f)
+AVAILABLE_TOOL_NAMES = [
+    schema.get("function", {}).get("name", "")
+    for schema in TOOL_SCHEMAS
+    if schema.get("function", {}).get("name")
+]
 
 # Responses API uses a flattened tool format (name/description/parameters at top level)
 TOOL_SCHEMAS_RESPONSES = [
@@ -56,9 +62,10 @@ class AgenticGenerator:
     back to direct generation).
     """
 
-    def __init__(self, llm_pool, config):
+    def __init__(self, llm_pool, config, trace_dir: Optional[str] = None):
         self.llm_pool = llm_pool
         self.config = config
+        self.trace_dir = trace_dir
 
     async def generate(self, system_message: str, user_message: str) -> Optional[str]:
         """Run the agent loop. Returns generated text, or None on failure."""
@@ -67,8 +74,11 @@ class AgenticGenerator:
         conversation: List[Dict[str, Any]] = []
         trace_log: List[Dict[str, Any]] = []
         t0 = time.time()
+        external_research_required = _requires_external_research(system_message)
+        external_research_nudge_sent = False
 
         sys_prompt = f"{system_message}\n\n{_AGENTIC_SYSTEM_PROMPT}"
+        logger.info("Agentic tools available: %s", ", ".join(AVAILABLE_TOOL_NAMES))
         repo_map = build_repo_map(
             cfg.codebase_root,
             max_depth=cfg.repo_map_max_depth,
@@ -128,6 +138,33 @@ class AgenticGenerator:
 
             if not tool_calls:
                 if text_content:
+                    external_research_used = any(
+                        entry.get("tool") in EXTERNAL_RESEARCH_TOOLS for entry in trace_log
+                    )
+                    if (
+                        external_research_required
+                        and not external_research_used
+                        and not external_research_nudge_sent
+                        and remaining > 0
+                    ):
+                        external_research_nudge_sent = True
+                        logger.info(
+                            "Agent attempted final response before external research; "
+                            "requesting one targeted web_search or research_papers call."
+                        )
+                        conversation.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Before producing the final program for this scientific "
+                                    "discovery task, make one targeted external research call "
+                                    "using `web_search` or `research_papers`, unless the tool "
+                                    "itself fails. Use the result to justify the next symbolic "
+                                    "structure, then output the complete improved program."
+                                ),
+                            }
+                        )
+                        continue
                     logger.info(
                         "Agent produced text at step %d (%d files read)", step, len(files_read)
                     )
@@ -178,23 +215,38 @@ class AgenticGenerator:
         return None
 
     def _save_trace(self, trace_log: list, conversation: list) -> None:
-        """Persist the agentic trace to a JSON file under codebase_root/reference/."""
+        """Persist the agentic trace to the run reference dir and codebase reference dir."""
         try:
-            root = self.config.codebase_root
-            if not root:
-                return
-            ref_dir = os.path.join(root, "reference")
-            os.makedirs(ref_dir, exist_ok=True)
             ts = time.strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(ref_dir, f"agentic_trace_{ts}.json")
             payload = {
                 "timestamp": ts,
+                "available_tools": AVAILABLE_TOOL_NAMES,
+                "external_research_tool_names": sorted(EXTERNAL_RESEARCH_TOOLS),
+                "external_research_tools_used": any(
+                    entry.get("tool") in EXTERNAL_RESEARCH_TOOLS for entry in trace_log
+                ),
+                "tool_call_count": len(trace_log),
                 "tool_calls": trace_log,
                 "conversation": _serialize_conversation(conversation),
             }
-            with open(path, "w") as f:
-                json.dump(payload, f, indent=2, default=str)
-            _agentic_log.info("Agentic trace saved to %s", path)
+            saved_paths = []
+
+            candidate_dirs = []
+            if self.trace_dir:
+                candidate_dirs.append(self.trace_dir)
+            root = self.config.codebase_root
+            if root:
+                candidate_dirs.append(os.path.join(root, "reference"))
+
+            for ref_dir in dict.fromkeys(candidate_dirs):
+                os.makedirs(ref_dir, exist_ok=True)
+                path = os.path.join(ref_dir, f"agentic_trace_{ts}.json")
+                with open(path, "w") as f:
+                    json.dump(payload, f, indent=2, default=str)
+                saved_paths.append(path)
+
+            if saved_paths:
+                _agentic_log.info("Agentic trace saved to %s", ", ".join(saved_paths))
         except Exception as e:
             logger.debug("Failed to save agentic trace: %s", e)
 
@@ -624,6 +676,18 @@ def _build_step_note(step: int, max_steps: int, remaining: int, time_left: float
             f"Start wrapping up — you must output a complete improved program before your turns run out."
         )
     return f"[Step {step + 1}/{max_steps} | {remaining} turns left | {time_str} remaining]"
+
+
+def _requires_external_research(system_message: str) -> bool:
+    """Detect benchmark prompts that explicitly ask for outside research."""
+    lowered = system_message.lower()
+    markers = (
+        "internet and paper tools are available and valuable",
+        "perform targeted research",
+        "governing relationships",
+        "external sources before proposing",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _err(msg: str) -> Dict[str, Any]:

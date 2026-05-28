@@ -98,6 +98,81 @@ _DISALLOWED_CONTROL_NODES = (
 )
 
 
+def _is_module_docstring(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    if not isinstance(node, ast.If):
+        return False
+    if node.orelse:
+        return False
+    test = node.test
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+        return False
+    if not isinstance(test.ops[0], ast.Eq):
+        return False
+    left = test.left
+    right = test.comparators[0]
+    return (
+        isinstance(left, ast.Name)
+        and left.id == "__name__"
+        and isinstance(right, ast.Constant)
+        and right.value == "__main__"
+    )
+
+
+def _has_postponed_annotations(tree: ast.Module) -> bool:
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            if any(alias.name == "annotations" for alias in node.names):
+                return True
+    return False
+
+
+def _function_annotations(node: ast.FunctionDef) -> list[ast.AST]:
+    annotations: list[ast.AST] = []
+    args = node.args
+    for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
+        if arg.annotation is not None:
+            annotations.append(arg.annotation)
+    if args.vararg is not None and args.vararg.annotation is not None:
+        annotations.append(args.vararg.annotation)
+    if args.kwarg is not None and args.kwarg.annotation is not None:
+        annotations.append(args.kwarg.annotation)
+    if node.returns is not None:
+        annotations.append(node.returns)
+    return annotations
+
+
+def _validate_top_level_function(node: ast.FunctionDef, *, postponed_annotations: bool) -> None:
+    if node.name in _PROTECTED_NAMES:
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: top-level function '{node.name}' "
+            "shadows a protected scorer or harness name."
+        )
+    if node.decorator_list:
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: top-level function decorators are not "
+            "allowed because decorators execute during candidate import."
+        )
+    if node.args.defaults or node.args.kw_defaults:
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: top-level function default arguments "
+            "are not allowed because defaults execute during candidate import."
+        )
+    if _function_annotations(node) and not postponed_annotations:
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: top-level function annotations require "
+            "'from __future__ import annotations' because annotations otherwise "
+            "execute during candidate import."
+        )
+
+
 def _call_name(func: ast.AST) -> str:
     if isinstance(func, ast.Name):
         return func.id
@@ -117,19 +192,106 @@ def _assigned_names(target: ast.AST) -> set[str]:
     return set()
 
 
+def _validate_plain_import(alias: ast.alias) -> None:
+    if alias.name not in _ALLOWED_IMPORTS:
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: import '{alias.name}' is not allowed. "
+            "Candidates may only import sympy/numpy and the equation harness."
+        )
+    if alias.name == "sympy" and alias.asname != "sp":
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: sympy must be imported canonically "
+            "as 'import sympy as sp'."
+        )
+    if alias.name == "numpy" and alias.asname not in {None, "np"}:
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: numpy may only be imported as "
+            "'import numpy' or 'import numpy as np'."
+        )
+
+
+def _validate_evaluate_expression_data_args(call: ast.Call) -> set[int]:
+    expected = ["X_train", "y_train", "X_val", "y_val"]
+    if len(call.args) < 5:
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: evaluate_expression() must be called "
+            "as evaluate_expression(expression, X_train, y_train, X_val, y_val, ...)."
+        )
+    actual_data_args = call.args[1:5]
+    if not all(
+        isinstance(arg, ast.Name) and arg.id == expected_name
+        for arg, expected_name in zip(actual_data_args, expected)
+    ):
+        raise ValueError(
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: evaluate_expression() must use the "
+            "canonical data arguments exactly as X_train, y_train, X_val, y_val. "
+            "Do not fit constants on validation labels or reorder the split."
+        )
+    return {id(arg) for arg in call.args[1:5]}
+
+
+def _x_train_shape_feature_arg_id(node: ast.AST) -> int | None:
+    if not (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "shape"
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "X_train"
+    ):
+        return None
+    slice_node = node.slice
+    if isinstance(slice_node, ast.Constant) and slice_node.value == 1:
+        return id(node.value.value)
+    return None
+
+
+def _allowed_feature_symbols_data_ids(fn: ast.FunctionDef) -> set[int]:
+    allowed: set[int] = set()
+    for node in ast.walk(fn):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "feature_symbols"
+            and len(node.args) == 1
+        ):
+            continue
+        x_train_id = _x_train_shape_feature_arg_id(node.args[0])
+        if x_train_id is not None:
+            allowed.add(x_train_id)
+    return allowed
+
+
+def _validate_no_dataset_data_leak(fn: ast.FunctionDef, allowed_node_ids: set[int]) -> None:
+    for node in ast.walk(fn):
+        if (
+            isinstance(node, ast.Name)
+            and node.id in {"X_train", "y_train", "X_val", "y_val"}
+            and id(node) not in allowed_node_ids
+        ):
+            raise ValueError(
+                f"{SINGLE_EQUATION_ERROR_PREFIX}: dataset array '{node.id}' may only "
+                "appear in feature_symbols(X_train.shape[1]) or as the canonical "
+                "evaluate_expression(expression, X_train, y_train, X_val, y_val, ...) "
+                "arguments. Do not use dataset values to choose expressions, mutate "
+                "splits, or tune constants/initial values."
+            )
+
+
 def validate_candidate_source(program_path: str) -> None:
     """Reject reward-hacking program structure before importing candidate code."""
     source = Path(program_path).read_text()
     tree = ast.parse(source, filename=program_path)
+    postponed_annotations = _has_postponed_annotations(tree)
 
     for node in tree.body:
+        if _is_module_docstring(node) or _is_main_guard(node):
+            continue
+        if isinstance(node, ast.FunctionDef):
+            _validate_top_level_function(node, postponed_annotations=postponed_annotations)
+            continue
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name not in _ALLOWED_IMPORTS:
-                    raise ValueError(
-                        f"{SINGLE_EQUATION_ERROR_PREFIX}: import '{alias.name}' is not allowed. "
-                        "Candidates may only import sympy/numpy and the equation harness."
-                    )
+                _validate_plain_import(alias)
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             if module not in _ALLOWED_FROM_IMPORTS:
@@ -137,6 +299,12 @@ def validate_candidate_source(program_path: str) -> None:
                     f"{SINGLE_EQUATION_ERROR_PREFIX}: from-import '{module}' is not allowed."
                 )
             if module == "pysr_harness.equation_session":
+                aliased = [alias.name for alias in node.names if alias.asname]
+                if aliased:
+                    raise ValueError(
+                        f"{SINGLE_EQUATION_ERROR_PREFIX}: harness imports may not "
+                        f"use aliases: {sorted(aliased)}."
+                    )
                 imported = {alias.name for alias in node.names}
                 extra = imported - _ALLOWED_HARNESS_IMPORTS
                 if extra:
@@ -145,6 +313,12 @@ def validate_candidate_source(program_path: str) -> None:
                         f"{sorted(extra)}. Use only feature_symbols, constant_symbols, "
                         "and evaluate_expression."
                     )
+        else:
+            raise ValueError(
+                f"{SINGLE_EQUATION_ERROR_PREFIX}: top-level executable code is not "
+                "allowed in candidate programs. Build and score the equation only "
+                "inside evaluate_symbolic_candidate()."
+            )
 
     eval_fns = [
         node
@@ -174,6 +348,9 @@ def validate_candidate_source(program_path: str) -> None:
             f"{SINGLE_EQUATION_ERROR_PREFIX}: evaluate_symbolic_candidate() must directly "
             "return evaluate_expression(...), with no wrapper or post-processing."
         )
+    allowed_data_arg_ids = _validate_evaluate_expression_data_args(return_value)
+    allowed_data_arg_ids.update(_allowed_feature_symbols_data_ids(fn))
+    _validate_no_dataset_data_leak(fn, allowed_data_arg_ids)
 
     evaluate_calls = 0
     for node in ast.walk(fn):
@@ -345,6 +522,110 @@ def load_all_datasets(
 
 
 NUM_WORKERS = int(os.environ.get("SKYDISCOVER_EVAL_WORKERS", min(8, os.cpu_count() or 4)))
+PARSIMONY_WEIGHT = float(os.environ.get("SKYDISCOVER_PARSIMONY_WEIGHT", "0.20"))
+PARSIMONY_COMPLEXITY_SCALE = float(
+    os.environ.get("SKYDISCOVER_PARSIMONY_COMPLEXITY_SCALE", "160")
+)
+
+
+def _parsimony_penalty_factor(complexity: float) -> float:
+    """Bounded penalty factor for expression complexity."""
+    if not np.isfinite(complexity) or PARSIMONY_COMPLEXITY_SCALE <= 0:
+        return 1.0
+    normalized = min(max(float(complexity), 0.0) / PARSIMONY_COMPLEXITY_SCALE, 1.0)
+    return max(0.0, 1.0 - PARSIMONY_WEIGHT * normalized)
+
+
+def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-dataset metrics without letting failed datasets disappear."""
+    nmse_vals = [r["nmse_val"] for r in per_dataset_results.values()]
+    complexity_vals = []
+    for r in per_dataset_results.values():
+        try:
+            value = float(r.get("complexity", float("nan")))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            complexity_vals.append(value)
+    aggregate_complexity = float(max(complexity_vals)) if complexity_vals else 0.0
+
+    violation_errors = sorted(
+        {
+            str(r.get("error"))
+            for r in per_dataset_results.values()
+            if r.get("error") and SINGLE_EQUATION_ERROR_PREFIX in str(r.get("error"))
+        }
+    )
+    failed_datasets = sorted(
+        name
+        for name, result in per_dataset_results.items()
+        if result.get("error") or not np.isfinite(float(result.get("nmse_val", float("inf"))))
+    )
+    templates = sorted(
+        {
+            str(r.get("equation_template"))
+            for r in per_dataset_results.values()
+            if r.get("combined_score", 0.0) > 0 and r.get("equation_template")
+        }
+    )
+
+    eq_template = ""
+    for r in per_dataset_results.values():
+        if r.get("equation"):
+            eq_template = r["equation"]
+            break
+
+    violation_error = None
+    if violation_errors:
+        violation_error = violation_errors[0]
+    elif failed_datasets:
+        examples = ", ".join(failed_datasets[:3])
+        violation_error = (
+            "Single-equation violation: candidate failed on "
+            f"{len(failed_datasets)}/{len(per_dataset_results)} datasets. "
+            "Failed datasets are not dropped from the aggregate reward. "
+            f"Examples: {examples}"
+        )
+    elif len(templates) > 1:
+        examples = "; ".join(templates[:3])
+        violation_error = (
+            "Single-equation violation: evaluate_symbolic_candidate() produced "
+            f"{len(templates)} distinct equation templates across datasets. "
+            "The base equation must be identical for all datasets; only fitted "
+            f"constants may vary. Example templates: {examples}"
+        )
+
+    if violation_error:
+        agg_nmse = float("inf")
+        agg_combined = 0.0
+        n_successful = 0
+    else:
+        agg_nmse = float(np.mean(nmse_vals)) if nmse_vals else float("inf")
+        raw_combined = (
+            float(1.0 / (1.0 + max(agg_nmse, 0.0))) if np.isfinite(agg_nmse) else 0.0
+        )
+        parsimony_factor = _parsimony_penalty_factor(aggregate_complexity)
+        agg_combined = raw_combined * parsimony_factor
+        n_successful = sum(1 for value in nmse_vals if np.isfinite(value))
+
+    aggregated = {
+        "equation": eq_template,
+        "nmse_val": agg_nmse,
+        "combined_score": agg_combined,
+        "fit_score": raw_combined if not violation_error else 0.0,
+        "complexity": aggregate_complexity,
+        "parsimony_weight": PARSIMONY_WEIGHT,
+        "parsimony_penalty_factor": (
+            _parsimony_penalty_factor(aggregate_complexity) if not violation_error else 1.0
+        ),
+        "n_datasets": len(per_dataset_results),
+        "n_successful": n_successful,
+        "eval_workers": NUM_WORKERS,
+        "per_dataset": per_dataset_results,
+    }
+    if violation_error:
+        aggregated["error"] = violation_error
+    return aggregated
 
 
 def evaluate_candidate_with_timeout(program_path: str, timeout_seconds: int = 3000) -> dict:
@@ -422,6 +703,7 @@ try:
             return ds_name, {{
                 "nmse_val": ds_nmse,
                 "combined_score": ds_combined,
+                "complexity": float(result.get("complexity", 0.0)),
                 "equation": str(result.get("equation", "")),
                 "equation_template": str(result.get("equation_template", "")),
                 "constants": result.get("constants", {{}}),
@@ -440,55 +722,7 @@ try:
             ds_name, ds_result = future.result()
             per_dataset_results[ds_name] = ds_result
 
-    combined_scores = [r["combined_score"] for r in per_dataset_results.values()]
-    nmse_vals = [r["nmse_val"] for r in per_dataset_results.values()]
-    finite_nmse = [v for v in nmse_vals if np.isfinite(v)]
-    agg_nmse = float(np.mean(finite_nmse)) if finite_nmse else float("inf")
-    agg_combined = float(1.0 / (1.0 + max(agg_nmse, 0.0))) if np.isfinite(agg_nmse) else 0.0
-
-    violation_errors = sorted(
-        {{
-            str(r.get("error"))
-            for r in per_dataset_results.values()
-            if r.get("error") and evaluator.SINGLE_EQUATION_ERROR_PREFIX in str(r.get("error"))
-        }}
-    )
-    templates = sorted(
-        {{
-            str(r.get("equation_template"))
-            for r in per_dataset_results.values()
-            if r.get("combined_score", 0.0) > 0 and r.get("equation_template")
-        }}
-    )
-
-    eq_template = ""
-    for r in per_dataset_results.values():
-        if r.get("equation"):
-            eq_template = r["equation"]
-            break
-
-    violation_error = None
-    if violation_errors:
-        violation_error = violation_errors[0]
-    elif len(templates) > 1:
-        examples = "; ".join(templates[:3])
-        violation_error = (
-            "Single-equation violation: evaluate_symbolic_candidate() produced "
-            f"{{len(templates)}} distinct equation templates across datasets. "
-            "The base equation must be identical for all datasets; only fitted "
-            f"constants may vary. Example templates: {{examples}}"
-        )
-
-    aggregated = {{
-        "equation": eq_template,
-        "nmse_val": float("inf") if violation_error else agg_nmse,
-        "combined_score": 0.0 if violation_error else agg_combined,
-        "n_datasets": len(datasets),
-        "n_successful": 0 if violation_error else sum(1 for s in combined_scores if s > 0),
-        "per_dataset": per_dataset_results,
-    }}
-    if violation_error:
-        aggregated["error"] = violation_error
+    aggregated = evaluator._aggregate_per_dataset_results(per_dataset_results)
 
     _write_payload_and_exit({{"result": aggregated}})
 except Exception as exc:
@@ -539,13 +773,17 @@ def _metrics_from_result(result: dict, eval_time: float) -> dict:
     return {
         "equation": str(result.get("equation", "")),
         "loss": nmse_val,
-        "complexity": 0.0,
+        "complexity": float(result.get("complexity", 0.0)),
         "nmse_train": float("inf"),
         "nmse_val": nmse_val,
         "combined_score": combined,
+        "fit_score": float(result.get("fit_score", combined)),
+        "parsimony_weight": float(result.get("parsimony_weight", PARSIMONY_WEIGHT)),
+        "parsimony_penalty_factor": float(result.get("parsimony_penalty_factor", 1.0)),
         "eval_time": float(eval_time),
         "n_datasets": result.get("n_datasets", 0),
         "n_successful": result.get("n_successful", 0),
+        "eval_workers": result.get("eval_workers", NUM_WORKERS),
         "per_dataset": result.get("per_dataset", {}),
         "error": str(result.get("error", "")),
     }
@@ -606,16 +844,18 @@ def _eval_stage1_worker(args):
         program, "run_discovery", None
     )
     if fn is None:
-        return 0.0, "missing evaluate_symbolic_candidate()"
+        return 0.0, "missing evaluate_symbolic_candidate()", ""
     n = min(200, len(X_train))
     m = min(80, len(X_val))
     try:
         with single_equation_evaluation():
             result = fn(X_train[:n], y_train[:n], X_val[:m], y_val[:m])
             validate_single_equation_result(result)
-        return float(result.get("combined_score", 0.0)), None
+        return float(result.get("combined_score", 0.0)), None, str(
+            result.get("equation_template", "")
+        )
     except Exception as exc:
-        return 0.0, str(exc)
+        return 0.0, str(exc), ""
 
 
 def evaluate_stage1(program_path: str) -> dict:
@@ -642,18 +882,63 @@ def evaluate_stage1(program_path: str) -> dict:
             futures = [executor.submit(_eval_stage1_worker, item) for item in work_items]
             worker_results = [future.result() for future in concurrent.futures.as_completed(futures)]
 
-        combined_scores = [score for score, _error in worker_results]
+        combined_scores = [score for score, _error, _template in worker_results]
+        successful_scores = [score for score in combined_scores if score > 0]
+        errors = sorted({error for _score, error, _template in worker_results if error})
         violation_errors = sorted(
             {
                 error
-                for _score, error in worker_results
+                for _score, error, _template in worker_results
                 if error and SINGLE_EQUATION_ERROR_PREFIX in error
             }
         )
         if violation_errors:
-            return {"combined_score": 0.0, "error": violation_errors[0]}
+            return {
+                "combined_score": 0.0,
+                "n_stage1_datasets": len(subset),
+                "n_stage1_successful": len(successful_scores),
+                "eval_workers": NUM_WORKERS,
+                "error": violation_errors[0],
+            }
+        if errors:
+            return {
+                "combined_score": 0.0,
+                "n_stage1_datasets": len(subset),
+                "n_stage1_successful": len(successful_scores),
+                "eval_workers": NUM_WORKERS,
+                "error": (
+                    "Single-equation violation: stage 1 candidate failed on "
+                    f"{len(errors)} dataset evaluations. Example: {errors[0]}"
+                ),
+            }
+        templates = sorted(
+            {
+                template
+                for score, _error, template in worker_results
+                if score > 0 and template
+            }
+        )
+        if len(templates) > 1:
+            examples = "; ".join(templates[:3])
+            return {
+                "combined_score": 0.0,
+                "n_stage1_datasets": len(subset),
+                "n_stage1_successful": len(successful_scores),
+                "eval_workers": NUM_WORKERS,
+                "error": (
+                    "Single-equation violation: stage 1 produced "
+                    f"{len(templates)} distinct equation templates across datasets. "
+                    "The base equation must be identical for all datasets. "
+                    f"Example templates: {examples}"
+                ),
+            }
         agg_combined = float(np.mean(combined_scores)) if combined_scores else 0.0
-        return {"combined_score": agg_combined}
+        return {
+            "combined_score": agg_combined,
+            "n_stage1_datasets": len(subset),
+            "n_stage1_successful": len(successful_scores),
+            "eval_workers": NUM_WORKERS,
+        }
     except Exception as exc:
         print(f"Stage 1 evaluation failed: {exc}")
         return {"combined_score": 0.0, "error": str(exc)}

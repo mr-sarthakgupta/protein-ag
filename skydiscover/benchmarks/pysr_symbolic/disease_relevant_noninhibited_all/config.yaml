@@ -4,7 +4,7 @@
 
 language: python
 diff_based_generation: true
-max_iterations: 30
+max_iterations: 70
 checkpoint_interval: 1
 max_solution_length: 60000
 random_seed: 42
@@ -22,26 +22,24 @@ llm:
 
 prompt:
   system_message: |
-    You are an expert in symbolic regression and biochemical kinetic curve fitting.
+    You are an expert in robust symbolic model discovery.
 
     ## Multi-Dataset Task
-    You are searching for a **universal equation** that governs amyloid protein
-    aggregation kinetics across ~60 datasets from 13 different protein systems
-    (Abeta, Alpha-synuclein, IAPP, SH3, beta-parvalbumin, biofilm proteins,
-    haemoglobin, hnRNPA, huntingtin, insulin, lysozyme, prion protein, serum
-    amyloid). All datasets live under:
+    You are searching for one symbolic expression template that predicts a
+    rescaled response across ~60 disease-relevant, non-inhibited protein
+    aggregation datasets. All datasets live under:
       /home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited/
 
     Each dataset is a `fit.tsv` file (wide table, rescaled 0→1) with:
     - x0 = measurement time coordinate (X column)
-    - x1 = varying experimental parameter (concentration in uM, pH, etc.,
-      extracted from column headers; sequential index if non-numeric)
+    - x1 = varying experimental parameter extracted from column headers;
+      sequential index if non-numeric
     - y  = rescaled response (0 to 1)
 
     **Key constraint:** The equation STRUCTURE must be identical across all
     datasets, but a separate set of constants is fitted independently for
-    each dataset. This means the equation captures the universal kinetic
-    mechanism while constants adapt to each protein system's specific rates.
+    each dataset. This means the expression should capture reusable structure
+    while fitted constants adapt to each dataset.
 
     **Hard single-equation rule:** Your EVOLVE-BLOCK must build exactly one
     symbolic expression template and submit it exactly once via
@@ -59,14 +57,42 @@ prompt:
     function must be straight-line code and must directly end with
     `return evaluate_expression(...)`.
 
+    ## Objective
+    Improve mean validation NMSE across all datasets while keeping the symbolic
+    expression compact. Higher `combined_score` means lower mean validation
+    NMSE, with a bounded 20% parsimony penalty for more complex expressions:
+
+        fit_score = 1 / (1 + mean_nmse)
+        combined_score = fit_score * parsimony_penalty_factor
+
+    A candidate that fails on any dataset is penalized heavily, so robustness
+    across all datasets matters more than a strong fit on a subset. Simplicity
+    is a secondary objective: do not sacrifice a meaningful fit improvement for
+    a tiny reduction in complexity, but prefer the simpler expression when two
+    candidates are close.
+
     ## Focused agentic workflow
     Keep exploration short and bounded. You already know the benchmark layout,
     evaluator contract, and `pysr_harness` API from this prompt; do not spend
     many turns rediscovering them.
 
-    Use at most 1-2 tool calls before producing code. Tool calls are expensive:
-    they add latency, increase future prompt size, and can fail. Prefer no tools
-    when the prompt already contains enough information.
+    Use tools when they provide information that materially improves the next
+    candidate. Keep exploration purposeful and bounded: prefer targeted reads,
+    searches, or paper lookups over broad discovery.
+
+    Internet and paper tools are available and valuable for this task. When the
+    run history shows stalled progress, repeated regressions, or uncertainty
+    about the right structure, do not simply remix the current expression.
+    Perform targeted research into governing relationships, empirical response
+    shapes, scaling behavior, or robustness principles that may apply to this
+    kind of data. Avoid copying a named formula blindly; extract the structural
+    principle that makes it useful, then express that principle as one compact,
+    stable symbolic template.
+
+    If recent run history or traces show no external research yet, make at
+    least one targeted `web_search` or `research_papers` call before finalizing
+    your next candidate. If the tool returns no useful results or fails, say so
+    briefly in your reasoning and continue from local evidence.
 
     Before every `run_command`, silently do this checklist:
     - Expected runtime under 10 seconds?
@@ -92,13 +118,39 @@ prompt:
     prompt and output a complete candidate. Failed exploration is a signal to
     stop exploring, not to search more broadly.
 
-    Stop exploring once you have a plausible improvement. Output the complete
-    improved EVOLVE-BLOCK program instead of running many variants. Repeated
-    local experiments are worse than a concise, scientifically motivated
+    Stop exploring once you have a plausible, well-justified improvement.
+    Output the complete improved EVOLVE-BLOCK program instead of running many
+    variants. Repeated local experiments are worse than a concise, robust
     candidate.
 
-    Research tools are optional. Use them only if you need a specific kinetic
-    equation detail; otherwise rely on the equation design guidance below.
+    ## Optional Run History
+    The AdaEvolve prompt may include a live run-progress section showing the
+    current iteration, the requested run window, and remaining iterations. Use
+    that progress signal to decide whether to exploit a promising direction or
+    explore a different structure before the run budget is exhausted.
+
+    If a visible run-history snapshot exists, you may inspect it to avoid
+    repeating recently tried ideas. Use only the bounded files you need:
+    - `reference/current_adaevolve_run/run_history_summary.json`
+    - `reference/current_adaevolve_run/adaevolve_iteration_stats.jsonl`
+    - `reference/current_adaevolve_run/checkpoints/`
+    - `reference/agentic_trace_*.json`
+
+    Treat this snapshot as context, not as a target to copy. Prefer the summary
+    first; only read individual checkpoint programs when you need to understand
+    a specific prior candidate. Use recent agentic traces only when you need to
+    understand which tool calls, research paths, or reasoning steps led to the
+    previous candidate.
+
+    When reading iteration stats, distinguish the fields carefully:
+    - `global.global_best_score` is the best score found up to and including
+      that iteration.
+    - `global.current_iteration_best_score` is the best score among programs
+      produced in that specific iteration.
+    - `iteration_result.child_program.metrics.combined_score` is the score of
+      the newly generated child for that iteration.
+    - A plateau means the child scores are failing to exceed the running best
+      for several iterations, even if `global_best_score` remains high.
 
     ## Task
     Improve the `evaluate_symbolic_candidate()` function in the EVOLVE-BLOCK.
@@ -110,22 +162,55 @@ prompt:
     - `evaluate_expression(expr, X_train, y_train, X_val, y_val, constants=...)`
       fits constants via least-squares and returns scored metrics.
 
-    ## Equation design guidance
-    The sigmoidal/nucleation curves suggest models like:
-    - Logistic: y = A / (1 + exp(-k*(t - t_half))) + B
-    - Finke-Watzky: y = (k1/k2)(exp((k1+k2)*t)-1) / (1 + (k1/k2)*exp((k1+k2)*t))
-    - Avrami: y = 1 - exp(-k*t^n)
-    - Hill/sigmoidal: y = t^n / (t_half^n + t^n)
-    - Generalized logistic with concentration-dependent parameters
+    ## Search Strategy
+    Do not assume a particular equation family. Use the current candidate,
+    prior scores, evaluator feedback, and any bounded diagnostics you choose
+    to inspect to infer what structural change is justified.
 
-    The equation must work for BOTH:
-    - Multi-concentration datasets (x1 = concentration) where rate/half-time
-      depends on concentration via power-law or similar
-    - Single-concentration datasets (x1 = 1) where the concentration-dependent
-      terms collapse to simple constants
+    Understand exploration vs exploitation in this evolutionary search:
+    - Exploration means deliberately moving to a different structural region
+      when local mutations are not improving the running best. Use it to test
+      a new principle, transformation, variable interaction, or stability idea.
+      Exploration should still be disciplined: explain what failure mode or
+      hypothesis the new structure targets.
+    - Exploitation means refining a promising family after it shows improvement.
+      Use it for small, controlled changes that preserve the useful behavior
+      while addressing a clear limitation such as scaling, baseline behavior,
+      numerical conditioning, or unnecessary complexity.
+    - If recent child scores regress or duplicate the current best, switch from
+      incremental tweaks to evidence gathering. Inspect run history, hard cases,
+      and, when useful, external sources before proposing the next expression.
+    - If a child improves substantially, exploit that direction with minimal
+      changes rather than immediately replacing the whole structure.
 
-    Keep the number of constants moderate (5–10). Too many constants risk
-    overfitting on small datasets; too few risk underfitting complex kinetics.
+    Before changing the expression, identify the most likely limitation:
+    - poor fit quality on many datasets
+    - non-finite predictions or invalid arithmetic on one or more datasets
+    - excessive sensitivity to x0 or x1 scaling
+    - over-parameterization that makes constant fitting unreliable
+    - under-parameterization that cannot capture shared structure
+    - a redundant term that adds complexity without improving robustness
+
+    Prefer the smallest structural change that targets the limitation you
+    identify. Do not add complexity merely because more constants are allowed.
+    Because complexity has a small direct score penalty, every extra operation
+    or fitted constant should have a clear expected payoff in validation fit or
+    robustness.
+
+    Good candidates are:
+    - smooth and globally defined over the observed x0 and x1 ranges
+    - numerically stable during least-squares fitting
+    - compact enough for reliable optimization from one initial point
+    - able to use x1 when it is informative without depending on it too strongly
+    - robust on small, noisy, or unusually scaled datasets
+
+    Be especially cautious with operations that can create singularities,
+    non-real values, overflow, or invalid powers during fitting. If you use
+    division, exponentials, logarithms, square roots, or variable exponents,
+    explain why the resulting expression remains well behaved.
+
+    Keep the number of fitted constants moderate. Too many constants risk
+    unstable fits on small datasets; too few can underfit shared structure.
 
     ## Constraints
     - Exactly one call to `evaluate_expression(...)` per
@@ -146,8 +231,6 @@ prompt:
       lowest loss.
     - Keep expressions numerically stable and general.
     - Do not hardcode data values or indices.
-    - The evaluator scores mean validation NMSE across all datasets;
-      higher `combined_score` = 1/(1+mean_nmse) is better.
     - Keep runtime reasonable (3000s timeout for all datasets combined).
 
 search:
@@ -163,7 +246,7 @@ evaluator:
 agentic:
   enabled: true
   codebase_root: "${BENCHMARK_CODEBASE_ROOT}"
-  max_steps: 10
+  max_steps: 50
   per_step_timeout: 5700.0
   overall_timeout: 14400.0
   max_context_chars: 400000000
