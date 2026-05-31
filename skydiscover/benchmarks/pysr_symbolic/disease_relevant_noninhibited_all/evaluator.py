@@ -40,10 +40,12 @@ _metrics_spec = _ilu.spec_from_file_location(
 _metrics_mod = _ilu.module_from_spec(_metrics_spec)
 _metrics_spec.loader.exec_module(_metrics_mod)
 combined_score_from_nmse = _metrics_mod.combined_score_from_nmse
+_base_nmse = _metrics_mod.nmse
 
 DATA_ROOT = Path("/home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited")
 RANDOM_STATE = 42
 TEST_SIZE = 0.25
+GAUSSIAN_SMOOTH_SIGMA = float(os.environ.get("SKYDISCOVER_GAUSSIAN_SMOOTH_SIGMA", "1.0"))
 SINGLE_EQUATION_ERROR_PREFIX = "Single-equation violation"
 _ALLOWED_IMPORTS = {"sympy", "numpy"}
 _ALLOWED_FROM_IMPORTS = {
@@ -501,8 +503,8 @@ def load_dataset(data_file: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, n
     rng = np.random.default_rng(RANDOM_STATE)
     indices = rng.permutation(len(y))
     split = int(round(len(y) * (1.0 - TEST_SIZE)))
-    train_idx = indices[:split]
-    val_idx = indices[split:]
+    train_idx = np.sort(indices[:split])
+    val_idx = np.sort(indices[split:])
     return X[train_idx], X[val_idx], y[train_idx], y[val_idx]
 
 
@@ -534,6 +536,24 @@ def _parsimony_penalty_factor(complexity: float) -> float:
         return 1.0
     normalized = min(max(float(complexity), 0.0) / PARSIMONY_COMPLEXITY_SCALE, 1.0)
     return max(0.0, 1.0 - PARSIMONY_WEIGHT * normalized)
+
+
+def _gaussian_smooth_1d(values: np.ndarray, sigma: float = GAUSSIAN_SMOOTH_SIGMA) -> np.ndarray:
+    values = np.asarray(values, dtype=float).ravel()
+    if values.size < 3 or sigma <= 0.0:
+        return values
+    radius = max(1, int(round(3.0 * sigma)))
+    offsets = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (offsets / sigma) ** 2)
+    kernel /= np.sum(kernel)
+    padded = np.pad(values, (radius, radius), mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def _nmse_with_gaussian_smoothed_target(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    raw_loss = _base_nmse(y_true, y_pred)
+    smooth_loss = _base_nmse(_gaussian_smooth_1d(y_true), y_pred)
+    return float(raw_loss + smooth_loss)
 
 
 def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -679,6 +699,8 @@ try:
     spec = importlib.util.spec_from_file_location("program", program_path)
     program = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(program)
+    import pysr_harness.equation_session as equation_session
+    equation_session.nmse = evaluator._nmse_with_gaussian_smoothed_target
     from pysr_harness.equation_session import (
         single_equation_evaluation,
         validate_single_equation_result,
@@ -835,6 +857,8 @@ def _eval_stage1_worker(args):
     spec = importlib.util.spec_from_file_location("program", program_path)
     program = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(program)
+    import pysr_harness.equation_session as equation_session
+    equation_session.nmse = _nmse_with_gaussian_smoothed_target
     from pysr_harness.equation_session import (
         single_equation_evaluation,
         validate_single_equation_result,
