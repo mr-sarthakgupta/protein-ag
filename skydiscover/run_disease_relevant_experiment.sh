@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Configuration (override via environment) ─────────────────────────
-MAX_COST="${MAX_COST:-50}"
+MAX_COST="${MAX_COST:-35}"
 ITERATIONS="${ITERATIONS:-30}"
 SEARCH="${SEARCH:-adaevolve}"  # supported: adaevolve, evox
 ALLOW_SMOKE_FAIL="${ALLOW_SMOKE_FAIL:-0}"
