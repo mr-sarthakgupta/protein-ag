@@ -553,7 +553,7 @@ def _gaussian_smooth_1d(values: np.ndarray, sigma: float = GAUSSIAN_SMOOTH_SIGMA
 def _nmse_with_gaussian_smoothed_target(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     raw_loss = _base_nmse(y_true, y_pred)
     smooth_loss = _base_nmse(_gaussian_smooth_1d(y_true), y_pred)
-    return float(raw_loss + smooth_loss)
+    return float((raw_loss + smooth_loss) / 2.0)
 
 
 def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
