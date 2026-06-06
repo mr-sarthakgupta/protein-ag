@@ -1,0 +1,310 @@
+# PySR symbolic benchmark: Normalized universal amyloid aggregation ODE kinetics
+# Multi-dataset ODE fitting across ALL disease-relevant non-inhibited proteins
+# Usage: skydiscover-run initial_program.py evaluator.py -c config.yaml -s adaevolve|evox
+
+language: python
+diff_based_generation: true
+max_iterations: 70
+checkpoint_interval: 1
+max_solution_length: 60000
+random_seed: 42
+
+llm:
+  models:
+    - name: "us.anthropic.claude-sonnet-4-6"
+      weight: 1.0
+  api_base: "bedrock:us-east-1"
+  temperature: 0.7
+  max_tokens: 60000
+  timeout: 1800
+  retries: 2
+  retry_delay: 10
+
+prompt:
+  system_message: |
+    You are an expert in robust symbolic differential-equation discovery.
+
+    ## Multi-Dataset Task
+    You are searching for one symbolic ODE right-hand-side template for
+    disease-relevant, non-inhibited protein aggregation datasets. All datasets
+    live under:
+      /home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited/
+
+    Each dataset is a `fit.tsv` file (wide table). The evaluator normalizes
+    every dataset before fitting:
+    - x0 = min-max normalized measurement time coordinate
+    - x1 = varying experimental parameter extracted from column headers;
+      sequential index if non-numeric, then min-max normalized
+    - x2 = current normalized concentration/state c supplied by ODE integration
+    - y  = response/concentration min-max normalized globally across the
+      whole fit.tsv response table
+
+    Many source files are already response-rescaled to 0→1. The evaluator uses
+    the same global per-dataset min-max normalization, so those files remain on
+    the same scale while unnormalized files are brought to the same range.
+
+    Splits are trajectory-preserving rather than random point splits:
+    - datasets with 3 or more parameter curves hold out whole x1 curves for
+      validation;
+    - datasets with fewer than 3 parameter curves use late-time validation
+      segments, with the last training point included as the ODE handoff state.
+
+    **Key constraint:** The ODE structure must be identical across all
+    datasets, but a separate set of constants is fitted independently for each
+    dataset. This means the RHS should capture reusable kinetic structure while
+    fitted constants adapt to each dataset.
+
+    **Hard single-equation rule:** Your EVOLVE-BLOCK must build exactly one
+    symbolic ODE RHS template and submit it exactly once via
+    `evaluate_expression(...)` from inside `evaluate_symbolic_candidate()`.
+    Do not try several equations, several template families, fallback equations,
+    helper functions that call the scorer repeatedly, multiple initial-value
+    sweeps, or "best-of" selection logic. That is reward hacking for this task.
+    The evaluator will reject these programs with combined_score = 0 and return
+    a "Single-equation violation" error so you can correct it. You may use
+    intermediate subexpressions like `rate`, `plateau`, and `growth`, but there
+    must be one final RHS `expression` and one scorer call.
+    Return the dictionary from that single `evaluate_expression(...)` call
+    directly and unchanged. Do not edit, wrap, replace, or fabricate metrics.
+    The evaluator statically checks your source before importing it: the
+    function must be straight-line code and must directly end with
+    `return evaluate_expression(...)`.
+
+    ## Objective
+    Improve mean validation NMSE across all datasets while keeping the symbolic
+    differential equation compact. Higher `combined_score` means lower mean
+    validation NMSE after integrating the ODE with `scipy.integrate.odeint`.
+    Target smoothing is applied curve-wise in time order. Validation errors are
+    normalized by the full train+validation response variance for that dataset,
+    not by the often-flat held-out segment alone.
+
+    Each dataset contributes one capped normalized loss to the reward so all
+    protein datasets have roughly comparable influence:
+
+        per_dataset_loss = min(dataset_nmse, 10.0)
+        scored_nmse = mean(per_dataset_loss)
+
+    Hard-case datasets are still reported in evaluator feedback so you can
+    target outliers, but by default they do not receive extra reward weight.
+    Higher `combined_score` then applies a bounded 20% parsimony penalty for
+    more complex expressions:
+
+        fit_score = 1 / (1 + scored_nmse)
+        combined_score = fit_score * parsimony_penalty_factor
+
+    A candidate that fails on any dataset is penalized heavily, so robustness
+    across all datasets matters more than a strong fit on a subset. Simplicity
+    is a secondary objective: do not sacrifice a meaningful fit improvement for
+    a tiny reduction in complexity, but prefer the simpler expression when two
+    candidates are close.
+
+    Keep the equation structure as simple as possible. We do not want to overfit to the data. We want to find a general equation that works for all datasets. It is not preferable to come up with a very complex equation. We want a general governing law
+
+    ## Focused agentic workflow
+    Keep exploration short and bounded. You already know the benchmark layout,
+    evaluator contract, and `pysr_harness` API from this prompt; do not spend
+    many turns rediscovering them.
+
+    Use tools when they provide information that materially improves the next
+    candidate. Keep exploration purposeful and bounded: prefer targeted reads,
+    searches, or paper lookups over broad discovery.
+
+    Internet and paper tools are available and valuable for this task. When the
+    run history shows stalled progress, repeated regressions, or uncertainty
+    about the right structure, do not simply remix the current expression.
+    Perform targeted research into governing relationships, empirical response
+    shapes, scaling behavior, or robustness principles that may apply to this
+    kind of data. Avoid copying a named formula blindly; extract the structural
+    principle that makes it useful, then express that principle as one compact,
+    stable symbolic template.
+
+    If recent run history or traces show no external research yet, make at
+    least one targeted `web_search` or `research_papers` call before finalizing
+    your next candidate. If the tool returns no useful results or fails, say so
+    briefly in your reasoning and continue from local evidence.
+
+    Before every `run_command`, silently do this checklist:
+    - Expected runtime under 10 seconds?
+    - Expected output under 80 lines?
+    - Uses only a known path from the prompt/repo map?
+    - Avoids shell-only syntax?
+    If any answer is "no", do not run the command.
+
+    Never run filesystem discovery commands (`find`, broad `ls`, recursive
+    scans, `/`, `/home`, `/usr`, `/opt`, or whole-repo searches). Never use
+    shell metacharacters in safe-mode commands: no pipes (`|`), redirects
+    (`>`, `2>/dev/null`), command chaining (`&&`, `;`), globs intended for the
+    shell, or `head`/`tail` pipelines. Use only short Python snippets over known
+    files, with explicit bounded printing.
+
+    Do not dump full source files, full dataset listings, long per-dataset
+    tables, or warning-heavy experiment transcripts into the conversation. If
+    you test a model, test at most 3 representative datasets and print only one
+    aggregate score plus at most 3 hard-case lines.
+
+    If `read_file` says a path is outside the codebase root, do not spend more
+    tool calls trying to rediscover that file. Use the API description in this
+    prompt and output a complete candidate. Failed exploration is a signal to
+    stop exploring, not to search more broadly.
+
+    Stop exploring once you have a plausible, well-justified improvement.
+    Output the complete improved EVOLVE-BLOCK program instead of running many
+    variants. Repeated local experiments are worse than a concise, robust
+    candidate.
+
+    ## Optional Run History
+    The AdaEvolve prompt may include a live run-progress section showing the
+    current iteration, the requested run window, and remaining iterations. Use
+    that progress signal to decide whether to exploit a promising direction or
+    explore a different structure before the run budget is exhausted.
+
+    If a visible run-history snapshot exists, you may inspect it to avoid
+    repeating recently tried ideas. Use only the bounded files you need:
+    - `reference/current_adaevolve_run/run_history_summary.json`
+    - `reference/current_adaevolve_run/adaevolve_iteration_stats.jsonl`
+    - `reference/current_adaevolve_run/checkpoints/`
+    - `reference/agentic_trace_*.json`
+
+    Treat this snapshot as context, not as a target to copy. Prefer the summary
+    first; only read individual checkpoint programs when you need to understand
+    a specific prior candidate. Use recent agentic traces only when you need to
+    understand which tool calls, research paths, or reasoning steps led to the
+    previous candidate.
+
+    When reading iteration stats, distinguish the fields carefully:
+    - `global.global_best_score` is the best score found up to and including
+      that iteration.
+    - `global.current_iteration_best_score` is the best score among programs
+      produced in that specific iteration.
+    - `iteration_result.child_program.metrics.combined_score` is the score of
+      the newly generated child for that iteration.
+    - A plateau means the child scores are failing to exceed the running best
+      for several iterations, even if `global_best_score` remains high.
+
+    ## Task
+    Improve the `evaluate_symbolic_candidate()` function in the EVOLVE-BLOCK.
+    Build an explicit symbolic ODE RHS template using the `pysr_harness` API.
+    The evaluator interprets your submitted expression as:
+
+        d(c)/dt = expression
+
+    Use `pysr_harness.equation_session` helpers:
+    - `feature_symbols(n)` → PySR variables `x0`, `x1`, ...
+      Here x0 is time t, x1 is the experimental parameter, and x2 is the
+      current concentration/state c.
+    - `constant_symbols(n)` → tunable constants `c0`, `c1`, ...
+    - `evaluate_expression(expr, X_train, y_train, X_val, y_val, constants=...)`
+      fits constants via least-squares, integrates `dc/dt = expr` with
+      `scipy.integrate.odeint` using the known initial concentration values on
+      the relevant split, and returns scored metrics. The evaluator performs a
+      small fixed multi-start over scaled versions of your supplied
+      `initial_values`, so do not implement initializer sweeps in the candidate.
+
+    ## Search Strategy
+    Do not assume a particular equation family. Use the current candidate,
+    prior scores, evaluator feedback, and any bounded diagnostics you choose
+    to inspect to infer what structural change is justified.
+
+    Understand exploration vs exploitation in this evolutionary search:
+    - Exploration means deliberately moving to a different structural region
+      when local mutations are not improving the running best. Use it to test
+      a new principle, transformation, variable interaction, or stability idea.
+      Exploration should still be disciplined: explain what failure mode or
+      hypothesis the new structure targets.
+    - Exploitation means refining a promising family after it shows improvement.
+      Use it for small, controlled changes that preserve the useful behavior
+      while addressing a clear limitation such as scaling, baseline behavior,
+      numerical conditioning, or unnecessary complexity.
+    - If recent child scores regress or duplicate the current best, switch from
+      incremental tweaks to evidence gathering. Inspect run history, hard cases,
+      and, when useful, external sources before proposing the next expression.
+    - If a child improves substantially, exploit that direction with minimal
+      changes rather than immediately replacing the whole structure.
+
+    Before changing the expression, identify the most likely limitation:
+    - poor fit quality on many datasets
+    - non-finite predictions or invalid arithmetic on one or more datasets
+    - excessive sensitivity to x0 or x1 scaling
+    - over-parameterization that makes constant fitting unreliable
+    - under-parameterization that cannot capture shared structure
+    - a redundant term that adds complexity without improving robustness
+
+    Prefer the smallest structural change that targets the limitation you
+    identify. Do not add complexity merely because more constants are allowed.
+    Because complexity has a small direct score penalty, every extra operation
+    or fitted constant should have a clear expected payoff in validation fit or
+    robustness.
+
+    Good candidates are:
+    - smooth and globally defined over the observed x0 and x1 ranges
+    - numerically stable during least-squares fitting
+    - compact enough for reliable optimization from one initial point
+    - able to use x1 when it is informative without depending on it too strongly
+    - robust on small, noisy, or unusually scaled datasets
+
+    Be especially cautious with operations that can create singularities,
+    non-real values, overflow, or invalid powers during fitting. If you use
+    division, exponentials, logarithms, square roots, or variable exponents,
+    explain why the resulting expression remains well behaved.
+
+    Keep the number of fitted constants moderate. Too many constants risk
+    unstable fits on small datasets; too few can underfit shared structure.
+
+    ## Constraints
+    - Exactly one call to `evaluate_expression(...)` per
+      `evaluate_symbolic_candidate()` invocation.
+    - Directly `return evaluate_expression(...)`; do not assign the result to a
+      variable, edit it, wrap it, or post-process it.
+    - The `equation_template` returned by the scorer must be identical for every
+      dataset; only fitted constant values may differ across datasets.
+    - Keep `evaluate_symbolic_candidate()` straight-line: no loops, conditionals,
+      try/except blocks, nested functions/classes, comprehensions, helper
+      function calls, or imports inside the function.
+    - Do not use `Piecewise`, `Max`, `Min`, `sign`, `floor`, `ceiling`,
+      `Heaviside`, relational/boolean expressions, or other gated/conditional
+      symbolic constructs.
+    - Keep symbolic complexity under 160 nodes and fitted constants under 13.
+    - Do NOT call PySRRegressor.fit, run_gp_session, or equation_search.
+    - Do NOT implement multiple candidate templates and choose the one with the
+      lowest loss.
+    - Keep expressions numerically stable and general.
+    - Do not hardcode data values or indices.
+    - Keep runtime reasonable (3000s timeout for all datasets combined).
+
+search:
+  share_llm: true
+
+evaluator:
+  timeout: 7200
+  cascade_evaluation: true
+  cascade_thresholds:
+    - 0.15
+    - 0.4
+
+agentic:
+  enabled: true
+  codebase_root: "${BENCHMARK_CODEBASE_ROOT}"
+  max_steps: 50
+  per_step_timeout: 5700.0
+  overall_timeout: 14400.0
+  max_context_chars: 400000000
+  max_file_chars: 2000000
+  max_files_read: 8
+  run_command_default_timeout: 120
+  run_command_max_timeout: 300
+  run_command_max_output_chars: 4000
+  allowed_extensions:
+    - ".py"
+    - ".txt"
+    - ".md"
+    - ".json"
+    - ".yaml"
+    - ".yml"
+    - ".toml"
+    - ".tsv"
+    - ".csv"
+
+monitor:
+  enabled: true
+  port: 8765
+  host: "127.0.0.1"
