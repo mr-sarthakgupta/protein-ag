@@ -44,7 +44,8 @@ _base_nmse = _metrics_mod.nmse
 
 DATA_ROOT = Path("/home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited")
 RANDOM_STATE = 42
-TEST_SIZE = 0.25
+TEST_SIZE = 0.35
+CONTIGUOUS_VAL_BLOCK_SIZE = 10
 GAUSSIAN_SMOOTH_SIGMA = float(os.environ.get("SKYDISCOVER_GAUSSIAN_SMOOTH_SIGMA", "1.0"))
 ODE_MULTISTART_SCALES = tuple(
     float(value)
@@ -508,39 +509,114 @@ def discover_datasets(root: Path = DATA_ROOT) -> list[tuple[str, Path]]:
     return datasets
 
 
+def _place_non_overlapping_blocks(
+    n_points: int,
+    block_sizes: list[int],
+    rng: np.random.Generator,
+) -> set[int] | None:
+    """Place contiguous blocks at random non-overlapping positions."""
+    val_local: set[int] = set()
+    for block_size in block_sizes:
+        valid_starts = [
+            start
+            for start in range(0, n_points - block_size + 1)
+            if not set(range(start, start + block_size)) & val_local
+        ]
+        if not valid_starts:
+            return None
+        start = int(valid_starts[int(rng.integers(len(valid_starts)))])
+        val_local.update(range(start, start + block_size))
+    return val_local
+
+
+def _scatter_points(
+    available: list[int],
+    n_scatter: int,
+    rng: np.random.Generator,
+) -> set[int]:
+    """Pick scattered validation points from unused curve indices."""
+    if n_scatter <= 0 or not available:
+        return set()
+    chosen = rng.choice(np.asarray(available, dtype=int), size=n_scatter, replace=False)
+    return {int(index) for index in np.atleast_1d(chosen)}
+
+
+def _contiguous_point_holdout(
+    ordered_idx: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[list[int], list[int]]:
+    """Hold out ~TEST_SIZE points as 10-point blocks plus scattered remainder."""
+    n_points = len(ordered_idx)
+    if n_points == 1:
+        idx = ordered_idx.tolist()
+        return idx, idx
+
+    n_val = min(max(1, int(round(n_points * TEST_SIZE))), n_points - 1)
+    n_full_blocks = n_val // CONTIGUOUS_VAL_BLOCK_SIZE
+    remainder = n_val % CONTIGUOUS_VAL_BLOCK_SIZE
+
+    if n_full_blocks == 0:
+        val_local = _scatter_points(list(range(n_points)), n_val, rng)
+    else:
+        block_sizes = [CONTIGUOUS_VAL_BLOCK_SIZE] * n_full_blocks
+        placement_order = list(block_sizes)
+        rng.shuffle(placement_order)
+        val_local = _place_non_overlapping_blocks(n_points, placement_order, rng)
+        if val_local is None:
+            val_local = _scatter_points(list(range(n_points)), n_val, rng)
+        elif remainder > 0:
+            available = [index for index in range(n_points) if index not in val_local]
+            val_local |= _scatter_points(available, remainder, rng)
+
+    val_indices = [int(ordered_idx[i]) for i in sorted(val_local)]
+    fit_indices = [int(ordered_idx[i]) for i in range(n_points) if i not in val_local]
+    return fit_indices, val_indices
+
+
 def _trajectory_preserving_split(
     X: np.ndarray,
     y: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Split by full parameter curves, using late-time holdout for <3 curves."""
+    """Split curves/points into fit (train) and NMSE-evaluation (val) sets."""
     parameters = np.unique(X[:, 1])
     rng = np.random.default_rng(RANDOM_STATE)
 
     if len(parameters) >= 3:
         shuffled = parameters[rng.permutation(len(parameters))]
-        n_val = min(max(1, int(round(len(parameters) * TEST_SIZE))), len(parameters) - 1)
-        val_params = set(float(p) for p in shuffled[:n_val])
-        val_mask = np.array([float(p) in val_params for p in X[:, 1]], dtype=bool)
-        train_idx = np.flatnonzero(~val_mask)
-        val_idx = np.flatnonzero(val_mask)
-        return X[train_idx], X[val_idx], y[train_idx], y[val_idx]
+        n_val_curves = min(
+            max(1, int(round(len(parameters) * TEST_SIZE))), len(parameters) - 1
+        )
+        val_params = {float(p) for p in shuffled[:n_val_curves]}
+
+        fit_indices: list[int] = []
+        val_indices: list[int] = []
+        for parameter in parameters:
+            curve_idx = np.flatnonzero(X[:, 1] == parameter)
+            if float(parameter) in val_params:
+                val_indices.extend(curve_idx.tolist())
+                continue
+
+            if len(curve_idx) == 1:
+                fit_indices.extend(curve_idx.tolist())
+                continue
+
+            ordered_idx = curve_idx[np.argsort(X[curve_idx, 0])]
+            curve_fit, curve_val = _contiguous_point_holdout(ordered_idx, rng)
+            fit_indices.extend(curve_fit)
+            val_indices.extend(curve_val)
+
+        fit_idx = np.sort(np.asarray(fit_indices, dtype=int))
+        val_idx = np.sort(np.asarray(val_indices, dtype=int))
+        return X[fit_idx], X[val_idx], y[fit_idx], y[val_idx]
 
     train_indices: list[int] = []
     val_indices: list[int] = []
     for parameter in parameters:
         curve_idx = np.flatnonzero(X[:, 1] == parameter)
         ordered_idx = curve_idx[np.argsort(X[curve_idx, 0])]
-        if len(ordered_idx) == 1:
-            train_indices.extend(ordered_idx.tolist())
-            val_indices.extend(ordered_idx.tolist())
-            continue
-
-        split = int(round(len(ordered_idx) * (1.0 - TEST_SIZE)))
-        split = min(max(split, 1), len(ordered_idx) - 1)
-        train_indices.extend(ordered_idx[:split].tolist())
-        # Include the last training point so validation integration starts from
-        # the known boundary state before predicting the held-out late segment.
-        val_indices.extend(ordered_idx[split - 1 :].tolist())
+        curve_fit, curve_val = _contiguous_point_holdout(ordered_idx, rng)
+        train_indices.extend(curve_fit)
+        val_indices.extend(curve_val)
 
     train_idx = np.sort(np.asarray(train_indices, dtype=int))
     val_idx = np.sort(np.asarray(val_indices, dtype=int))
@@ -749,6 +825,7 @@ def evaluate_ode_expression(
             "complexity": equation_session._complexity(template),
             "nmse_train": nmse_train,
             "nmse_val": nmse_val,
+            "n_val_points": int(len(y_val)),
             "combined_score": combined_score_from_nmse(nmse_val),
         }
         equation_session._record_scorer_result(result)
@@ -812,10 +889,29 @@ def evaluate_ode_expression(
         "complexity": equation_session._complexity(template),
         "nmse_train": nmse_train,
         "nmse_val": nmse_val,
+        "n_val_points": int(len(y_val)),
         "combined_score": combined_score_from_nmse(nmse_val),
     }
     equation_session._record_scorer_result(result)
     return result
+
+
+def _point_weighted_mean(
+    values: list[float],
+    weights: list[int],
+) -> float:
+    """Average values with one weight per evaluation point."""
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return float("inf")
+    weighted = sum(
+        float(value) * float(weight)
+        for value, weight in zip(values, weights)
+        if np.isfinite(float(value))
+    )
+    if not np.isfinite(weighted):
+        return float("inf")
+    return float(weighted / total_weight)
 
 
 def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -906,8 +1002,11 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         agg_combined = 0.0
         n_successful = 0
     else:
-        mean_nmse = float(np.mean(nmse_vals)) if nmse_vals else float("inf")
-        raw_mean_nmse = float(np.mean(raw_nmse_vals)) if raw_nmse_vals else float("inf")
+        val_point_weights = [
+            int(r.get("n_val_points", 0)) for r in per_dataset_results.values()
+        ]
+        mean_nmse = _point_weighted_mean(nmse_vals, val_point_weights)
+        raw_mean_nmse = _point_weighted_mean(raw_nmse_vals, val_point_weights)
         agg_nmse = mean_nmse + HARD_CASE_TAIL_WEIGHT * hard_case_tail_nmse
         agg_train_nmse = float(np.mean(train_nmse_vals)) if train_nmse_vals else float("inf")
         raw_combined = (
@@ -1024,6 +1123,7 @@ try:
             return ds_name, {{
                 "nmse_train": ds_train_nmse,
                 "nmse_val": ds_nmse,
+                "n_val_points": int(result.get("n_val_points", 0)),
                 "combined_score": ds_combined,
                 "complexity": float(result.get("complexity", 0.0)),
                 "equation": str(result.get("equation", "")),

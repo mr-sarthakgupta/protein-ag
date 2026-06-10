@@ -43,11 +43,13 @@ prompt:
     the same global per-dataset min-max normalization, so those files remain on
     the same scale while unnormalized files are brought to the same range.
 
-    Splits are trajectory-preserving rather than random point splits:
+    Splits separate constant fitting from NMSE evaluation:
     - datasets with 3 or more parameter curves hold out whole x1 curves for
-      validation;
-    - datasets with fewer than 3 parameter curves use late-time validation
-      segments, with the last training point included as the ODE handoff state.
+      validation and also hold out 35% of points from the remaining train curves
+      for NMSE as contiguous 10-point time segments plus any remainder points
+      scattered on the curve;
+    - datasets with fewer than 3 parameter curves use the same contiguous 35%
+      point holdout for NMSE.
 
     **Key constraint:** The ODE structure must be identical across all
     datasets, but a separate set of constants is fitted independently for each
@@ -78,11 +80,11 @@ prompt:
     normalized by the full train+validation response variance for that dataset,
     not by the often-flat held-out segment alone.
 
-    Each dataset contributes one capped normalized loss to the reward so all
-    protein datasets have roughly comparable influence:
+    Each validation point counts equally in the aggregate reward. Datasets with
+    more held-out points therefore contribute proportionally more:
 
         per_dataset_loss = min(dataset_nmse, 10.0)
-        scored_nmse = mean(per_dataset_loss)
+        scored_nmse = sum(per_dataset_loss * n_val_points) / sum(n_val_points)
 
     Hard-case datasets are still reported in evaluator feedback so you can
     target outliers, but by default they do not receive extra reward weight.
