@@ -403,52 +403,35 @@ def validate_candidate_source(program_path: str) -> None:
 
 
 def _parse_parameter_from_column(column_name: str) -> float | None:
-    """Extract a numeric parameter value from a fit.tsv column header.
+    """Extract a monomer/protein concentration from a fit.tsv column header.
 
-    Handles diverse header formats found across disease-relevant datasets:
+    Only concentration-like labels are accepted:
       - "... : 10uM"  or "10 uM"  → 10.0
       - "35uM" (bare, as in Abeta) → 35.0
       - "... : 3.95mM"             → 3950.0  (converted to uM)
       - "... : 0.3 mg/mL 22uM"    → 22.0    (prefer uM when both present)
-      - "... : pH 2.7"             → 2.7
-      - "... : 5% seeds"           → 5.0
-      - "20 ng/ul"                 → 20.0
-      - Non-numeric labels (WT, C19S, acid 10min, ...) → None
+
+    Seed percentages, pH values, ng/uL seed-material labels, and generic
+    numeric fallbacks are intentionally ignored so x1 consistently represents
+    the aggregating monomer/protein concentration when available.
     """
     text = column_name.strip()
+    # Prefer the human-readable condition after the file-name prefix. Some
+    # filenames contain seed concentrations that should not become x1.
+    condition_text = text.rsplit(":", 1)[-1].strip().strip("\"'")
 
     # Prefer an explicit uM value
-    m = re.search(r"(\d+(?:\.\d+)?)\s*uM", text, re.IGNORECASE)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*uM", condition_text, re.IGNORECASE)
     if m:
         return float(m.group(1))
 
     # mM → convert to uM
-    m = re.search(r"(\d+(?:\.\d+)?)\s*mM", text, re.IGNORECASE)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*mM", condition_text, re.IGNORECASE)
     if m:
         return float(m.group(1)) * 1000.0
 
     # mg/mL (take the number)
-    m = re.search(r"(\d+(?:\.\d+)?)\s*mg/mL", text, re.IGNORECASE)
-    if m:
-        return float(m.group(1))
-
-    # ng/ul
-    m = re.search(r"(\d+(?:\.\d+)?)\s*ng/ul", text, re.IGNORECASE)
-    if m:
-        return float(m.group(1))
-
-    # pH value
-    m = re.search(r"pH\s+(\d+(?:\.\d+)?)", text, re.IGNORECASE)
-    if m:
-        return float(m.group(1))
-
-    # Percentage (e.g. "5% seeds")
-    m = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
-    if m:
-        return float(m.group(1))
-
-    # Last resort: try to find any trailing number after colon/space
-    m = re.search(r":\s*(\d+(?:\.\d+)?)\s*$", text)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*mg/mL", condition_text, re.IGNORECASE)
     if m:
         return float(m.group(1))
 
@@ -467,14 +450,14 @@ def _minmax_normalize(values: np.ndarray) -> np.ndarray:
 
 
 def _load_fit_table(data_file: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load a wide fit.tsv and return normalized X=[time, parameter, c], y.
+    """Load a wide fit.tsv and return X=[normalized time, raw parameter, c], y.
 
     The first column is always the time/measurement coordinate. Remaining
-    columns are response curves. The varying parameter (concentration, pH,
-    etc.) is extracted from the header; if extraction fails, sequential
-    indices 1, 2, 3, ... are used. Each dataset is then min-max normalized:
-    time and parameter independently to 0..1, and the response globally across
-    the whole fit.tsv to 0..1. Files already rescaled to 0..1 keep that scale.
+    columns are response curves. The varying parameter is extracted from
+    concentration-like curve headers only; non-concentration columns are skipped.
+    Time is min-max normalized to 0..1, but the parameter column is left in its
+    parsed raw units. The response is normalized globally across the whole
+    fit.tsv to 0..1. Files already rescaled to 0..1 keep that scale.
     """
     with data_file.open(newline="") as f:
         reader = csv.reader(f, delimiter="\t")
@@ -482,10 +465,6 @@ def _load_fit_table(data_file: Path) -> tuple[np.ndarray, np.ndarray]:
 
         response_headers = header[1:]
         parsed_params = [_parse_parameter_from_column(h) for h in response_headers]
-        if all(p is not None for p in parsed_params):
-            parameters = [float(p) for p in parsed_params]
-        else:
-            parameters = [float(i + 1) for i in range(len(response_headers))]
 
         features: list[list[float]] = []
         targets: list[float] = []
@@ -493,7 +472,9 @@ def _load_fit_table(data_file: Path) -> tuple[np.ndarray, np.ndarray]:
             if not row:
                 continue
             measurement_x = float(row[0])
-            for param, value in zip(parameters, row[1:]):
+            for param, value in zip(parsed_params, row[1:]):
+                if param is None:
+                    continue
                 if value == "" or value.strip().lower() == "nan":
                     continue
                 features.append([measurement_x, param])
@@ -504,12 +485,13 @@ def _load_fit_table(data_file: Path) -> tuple[np.ndarray, np.ndarray]:
 
     X = np.asarray(features, dtype=float)
     y = np.asarray(targets, dtype=float)
-    X_norm = np.column_stack([_minmax_normalize(X[:, i]) for i in range(X.shape[1])])
+    time_norm = _minmax_normalize(X[:, 0])
+    parameter_raw = X[:, 1]
     y_norm = _minmax_normalize(y)
 
     # x2 is the concentration state c used by ODE RHS templates. During scoring
     # it is supplied from odeint's dynamic state, not read from candidate code.
-    X_ode = np.column_stack([X_norm, y_norm])
+    X_ode = np.column_stack([time_norm, parameter_raw, y_norm])
     return X_ode, y_norm
 
 
