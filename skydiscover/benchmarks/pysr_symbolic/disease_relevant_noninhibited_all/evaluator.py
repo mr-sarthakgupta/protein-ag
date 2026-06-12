@@ -44,7 +44,26 @@ _base_nmse = _metrics_mod.nmse
 
 DATA_ROOT = Path("/home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited")
 RANDOM_STATE = 42
-TEST_SIZE = 0.25
+TEST_SIZE = 0.35
+# Entire fit.tsv datasets held out for cross-protein evaluation: all points go to
+# validation and constants are fitted on that validation data at scoring time.
+EVALUATION_ONLY_DATASETS = frozenset(
+    {
+        # Multi-curve cross-protein holdouts
+        "Abeta/Cohen2013/Ab42_sec_IN_HOURS",  # 10 parameter curves
+        "Abeta/Meisl2014/Ab40_sec_IN_HOURS",  # 11 parameter curves
+        "htt/Kakkar2016/FIts/Kakkar2016_6kDa_polyQ_prim",  # 4 parameter curves
+        "htt/Kar2011/Fits/Kar2011_Q30_without_lowest_conc_sec",  # 5 parameter curves
+        "biofilm proteins/CsgA/CsgA_prim_IN_HOURS",  # 6 parameter curves
+        "biofilm proteins/RdlB_Yang2017/Fits/5and20uM_prim",  # 2 parameter curves
+        # Single-curve cross-protein holdouts
+        "IAPP/Daval2010/Fits/Daval2010_prim",
+        "IAPP/Daval2010/Fits/Daval2010_sec",
+        "hnRNPA/Kim2013/Fits/Kim2013_A1_prim",
+        "insulin/Fits/Nielsen2001_seeded_sec",
+        "lysozyme/Fits/Hasecke2018_7uM_sec",
+    }
+)
 GAUSSIAN_SMOOTH_SIGMA = float(os.environ.get("SKYDISCOVER_GAUSSIAN_SMOOTH_SIGMA", "1.0"))
 SINGLE_EQUATION_ERROR_PREFIX = "Single-equation violation"
 _ALLOWED_IMPORTS = {"sympy", "numpy"}
@@ -395,65 +414,61 @@ def validate_candidate_source(program_path: str) -> None:
 
 
 def _parse_parameter_from_column(column_name: str) -> float | None:
-    """Extract a numeric parameter value from a fit.tsv column header.
+    """Extract a monomer/protein concentration from a fit.tsv column header.
 
-    Handles diverse header formats found across disease-relevant datasets:
-      - "... : 10uM"  or "10 uM"  → 10.0
-      - "35uM" (bare, as in Abeta) → 35.0
-      - "... : 3.95mM"             → 3950.0  (converted to uM)
-      - "... : 0.3 mg/mL 22uM"    → 22.0    (prefer uM when both present)
-      - "... : pH 2.7"             → 2.7
-      - "... : 5% seeds"           → 5.0
-      - "20 ng/ul"                 → 20.0
-      - Non-numeric labels (WT, C19S, acid 10min, ...) → None
+    Only concentration-like labels are accepted:
+      - "... : 10uM"  or "10 uM"  -> 10.0
+      - "35uM" (bare, as in Abeta) -> 35.0
+      - "... : 3.95mM"             -> 3950.0  (converted to uM)
+      - "... : 0.3 mg/mL 22uM"    -> 22.0    (prefer uM when both present)
+
+    Seed percentages, pH values, ng/uL seed-material labels, and generic
+    numeric fallbacks are intentionally ignored so x1 consistently represents
+    the aggregating monomer/protein concentration when available.
     """
     text = column_name.strip()
+    # Prefer the human-readable condition after the file-name prefix. Some
+    # filenames contain seed concentrations that should not become x1.
+    condition_text = text.rsplit(":", 1)[-1].strip().strip("\"'")
 
     # Prefer an explicit uM value
-    m = re.search(r"(\d+(?:\.\d+)?)\s*uM", text, re.IGNORECASE)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*uM", condition_text, re.IGNORECASE)
     if m:
         return float(m.group(1))
 
-    # mM → convert to uM
-    m = re.search(r"(\d+(?:\.\d+)?)\s*mM", text, re.IGNORECASE)
+    # mM -> convert to uM
+    m = re.search(r"(\d+(?:\.\d+)?)\s*mM", condition_text, re.IGNORECASE)
     if m:
         return float(m.group(1)) * 1000.0
 
     # mg/mL (take the number)
-    m = re.search(r"(\d+(?:\.\d+)?)\s*mg/mL", text, re.IGNORECASE)
-    if m:
-        return float(m.group(1))
-
-    # ng/ul
-    m = re.search(r"(\d+(?:\.\d+)?)\s*ng/ul", text, re.IGNORECASE)
-    if m:
-        return float(m.group(1))
-
-    # pH value
-    m = re.search(r"pH\s+(\d+(?:\.\d+)?)", text, re.IGNORECASE)
-    if m:
-        return float(m.group(1))
-
-    # Percentage (e.g. "5% seeds")
-    m = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
-    if m:
-        return float(m.group(1))
-
-    # Last resort: try to find any trailing number after colon/space
-    m = re.search(r":\s*(\d+(?:\.\d+)?)\s*$", text)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*mg/mL", condition_text, re.IGNORECASE)
     if m:
         return float(m.group(1))
 
     return None
 
 
+def _minmax_normalize(values: np.ndarray) -> np.ndarray:
+    """Normalize one dataset column to 0..1, preserving constants as zeros."""
+    values = np.asarray(values, dtype=float)
+    v_min = float(np.min(values))
+    v_max = float(np.max(values))
+    scale = v_max - v_min
+    if scale <= 0.0:
+        return np.zeros_like(values, dtype=float)
+    return (values - v_min) / scale
+
+
 def _load_fit_table(data_file: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load a wide fit.tsv and return X=[measurement_x, parameter], y.
+    """Load a wide fit.tsv and return X=[normalized time, raw parameter], y.
 
     The first column is always the time/measurement coordinate. Remaining
-    columns are response curves. The varying parameter (concentration, pH,
-    etc.) is extracted from the header; if extraction fails, sequential
-    indices 1, 2, 3, ... are used.
+    columns are response curves. The varying parameter is extracted from
+    concentration-like curve headers only; non-concentration columns are skipped.
+    Time is min-max normalized to 0..1, but the parameter column is left in its
+    parsed raw units. The response is normalized globally across the whole
+    fit.tsv to 0..1. Files already rescaled to 0..1 keep that scale.
     """
     with data_file.open(newline="") as f:
         reader = csv.reader(f, delimiter="\t")
@@ -461,10 +476,6 @@ def _load_fit_table(data_file: Path) -> tuple[np.ndarray, np.ndarray]:
 
         response_headers = header[1:]
         parsed_params = [_parse_parameter_from_column(h) for h in response_headers]
-        if all(p is not None for p in parsed_params):
-            parameters = [float(p) for p in parsed_params]
-        else:
-            parameters = [float(i + 1) for i in range(len(response_headers))]
 
         features: list[list[float]] = []
         targets: list[float] = []
@@ -472,7 +483,9 @@ def _load_fit_table(data_file: Path) -> tuple[np.ndarray, np.ndarray]:
             if not row:
                 continue
             measurement_x = float(row[0])
-            for param, value in zip(parameters, row[1:]):
+            for param, value in zip(parsed_params, row[1:]):
+                if param is None:
+                    continue
                 if value == "" or value.strip().lower() == "nan":
                     continue
                 features.append([measurement_x, param])
@@ -481,7 +494,13 @@ def _load_fit_table(data_file: Path) -> tuple[np.ndarray, np.ndarray]:
     if not features:
         raise ValueError(f"No regression samples loaded from {data_file}")
 
-    return np.asarray(features, dtype=float), np.asarray(targets, dtype=float)
+    X = np.asarray(features, dtype=float)
+    y = np.asarray(targets, dtype=float)
+    time_norm = _minmax_normalize(X[:, 0])
+    parameter_raw = X[:, 1]
+    y_norm = _minmax_normalize(y)
+
+    return np.column_stack([time_norm, parameter_raw]), y_norm
 
 
 def discover_datasets(root: Path = DATA_ROOT) -> list[tuple[str, Path]]:
@@ -497,15 +516,64 @@ def discover_datasets(root: Path = DATA_ROOT) -> list[tuple[str, Path]]:
     return datasets
 
 
-def load_dataset(data_file: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load a single fit.tsv and return deterministic train/val split."""
-    X, y = _load_fit_table(data_file)
+def _trajectory_preserving_split(
+    X: np.ndarray,
+    y: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Split whole parameter curves into fit (train) and NMSE-evaluation (val) sets."""
+    parameters = np.unique(X[:, 1])
     rng = np.random.default_rng(RANDOM_STATE)
-    indices = rng.permutation(len(y))
-    split = int(round(len(y) * (1.0 - TEST_SIZE)))
-    train_idx = np.sort(indices[:split])
-    val_idx = np.sort(indices[split:])
-    return X[train_idx], X[val_idx], y[train_idx], y[val_idx]
+
+    if len(parameters) < 3:
+        empty_X = np.empty((0, X.shape[1]), dtype=float)
+        empty_y = np.empty(0, dtype=float)
+        return X, empty_X, y, empty_y
+
+    shuffled = parameters[rng.permutation(len(parameters))]
+    n_val_curves = min(
+        max(1, int(round(len(parameters) * TEST_SIZE))), len(parameters) - 1
+    )
+    val_params = {float(p) for p in shuffled[:n_val_curves]}
+
+    fit_indices: list[int] = []
+    val_indices: list[int] = []
+    for parameter in parameters:
+        curve_idx = np.flatnonzero(X[:, 1] == parameter)
+        if float(parameter) in val_params:
+            val_indices.extend(curve_idx.tolist())
+        else:
+            fit_indices.extend(curve_idx.tolist())
+
+    fit_idx = np.sort(np.asarray(fit_indices, dtype=int))
+    val_idx = np.sort(np.asarray(val_indices, dtype=int))
+    return X[fit_idx], X[val_idx], y[fit_idx], y[val_idx]
+
+
+def _evaluation_only_split(
+    X: np.ndarray,
+    y: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Hold out an entire dataset for validation-only cross-protein evaluation."""
+    empty_X = np.empty((0, X.shape[1]), dtype=float)
+    empty_y = np.empty(0, dtype=float)
+    return empty_X, X, empty_y, y
+
+
+def _dataset_name_from_path(data_file: Path, root: Path = DATA_ROOT) -> str:
+    return str(data_file.parent.relative_to(root)).replace(os.sep, "/")
+
+
+def load_dataset(
+    data_file: Path,
+    *,
+    dataset_name: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load a single fit.tsv and return deterministic trajectory-preserving split."""
+    X, y = _load_fit_table(data_file)
+    name = dataset_name or _dataset_name_from_path(data_file)
+    if name in EVALUATION_ONLY_DATASETS:
+        return _evaluation_only_split(X, y)
+    return _trajectory_preserving_split(X, y)
 
 
 def load_all_datasets(
@@ -516,7 +584,7 @@ def load_all_datasets(
     results = []
     for name, path in entries:
         try:
-            X_train, X_val, y_train, y_val = load_dataset(path)
+            X_train, X_val, y_train, y_val = load_dataset(path, dataset_name=name)
             results.append((name, X_train, X_val, y_train, y_val))
         except Exception as exc:
             print(f"Warning: skipping dataset {name}: {exc}")
@@ -550,15 +618,207 @@ def _gaussian_smooth_1d(values: np.ndarray, sigma: float = GAUSSIAN_SMOOTH_SIGMA
     return np.convolve(padded, kernel, mode="valid")
 
 
-def _nmse_with_gaussian_smoothed_target(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    raw_loss = _base_nmse(y_true, y_pred)
-    smooth_loss = _base_nmse(_gaussian_smooth_1d(y_true), y_pred)
-    return float((raw_loss + smooth_loss) / 2.0)
+def _curve_smoothed_target(X: np.ndarray, y_true: np.ndarray) -> np.ndarray:
+    """Smooth targets independently for each parameter curve in time order."""
+    X = np.asarray(X, dtype=float)
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    if X.shape[0] != y_true.shape[0] or X.shape[1] < 2:
+        return _gaussian_smooth_1d(y_true)
+
+    smoothed = np.empty_like(y_true, dtype=float)
+    for parameter in np.unique(X[:, 1]):
+        curve_idx = np.flatnonzero(X[:, 1] == parameter)
+        ordered_idx = curve_idx[np.argsort(X[curve_idx, 0])]
+        smoothed_curve = _gaussian_smooth_1d(y_true[ordered_idx])
+        smoothed[ordered_idx] = smoothed_curve
+    return smoothed
+
+
+def _normalized_mse_with_reference_variance(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    reference_values: np.ndarray,
+) -> float:
+    """MSE normalized by full dataset scale, not by a flat validation segment."""
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+    reference_values = np.asarray(reference_values, dtype=float).reshape(-1)
+    if y_true.shape != y_pred.shape:
+        return float("inf")
+    if not np.all(np.isfinite(y_pred)):
+        return float("inf")
+    var = float(np.var(reference_values))
+    if var <= 0.0:
+        return float(np.mean((y_true - y_pred) ** 2))
+    return float(np.mean((y_true - y_pred) ** 2) / var)
+
+
+def _nmse_with_gaussian_smoothed_target(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    X: np.ndarray | None = None,
+    reference_values: np.ndarray | None = None,
+) -> float:
+    reference = y_true if reference_values is None else reference_values
+    return _normalized_mse_with_reference_variance(y_true, y_pred, reference)
+
+
+def evaluate_symbolic_expression(
+    expression: Any,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    *,
+    constants: Any | None = None,
+    initial_values: Any | None = None,
+    max_nfev: int = 300,
+) -> dict[str, Any]:
+    """Score a proposed expression by directly predicting normalized response."""
+    import sympy as sp
+    from pysr_harness import equation_session
+    from scipy.optimize import least_squares
+
+    X_train = np.asarray(X_train, dtype=float)
+    y_train = np.asarray(y_train, dtype=float).reshape(-1)
+    X_val = np.asarray(X_val, dtype=float)
+    y_val = np.asarray(y_val, dtype=float).reshape(-1)
+    evaluation_only = X_train.shape[0] == 0 and X_val.shape[0] > 0
+    train_only = X_val.shape[0] == 0 and X_train.shape[0] > 0
+    if evaluation_only:
+        X_fit, y_fit = X_val, y_val
+    else:
+        X_fit, y_fit = X_train, y_train
+    y_reference = np.concatenate([y_train, y_val]) if y_train.size else y_val
+    n_features = X_fit.shape[1] if X_fit.shape[0] else X_val.shape[1]
+    feature_names = [f"x{i}" for i in range(n_features)]
+    template = equation_session._as_sympy_expr(expression, feature_names)
+    equation_session._record_scored_template(template)
+
+    if constants is None:
+        feature_set = set(equation_session.feature_symbols(n_features))
+        constants = sorted(template.free_symbols - feature_set, key=lambda s: s.name)
+    constants = list(constants)
+    equation_session._validate_expression_template(template, constants)
+
+    if initial_values is None:
+        x0 = np.ones(len(constants), dtype=float)
+    else:
+        x0 = np.asarray(initial_values, dtype=float).reshape(-1)
+        if x0.size != len(constants):
+            raise ValueError("initial_values must match the number of constants")
+
+    if not constants:
+        fitted_expr = template
+        fitted_constants = {}
+    else:
+        feature_syms = equation_session.feature_symbols(n_features)
+        X_cols = [X_fit[:, i] for i in range(n_features)]
+        compiled = sp.lambdify(feature_syms + constants, template, modules=["numpy"])
+
+        def residual(theta: np.ndarray) -> np.ndarray:
+            try:
+                args = X_cols + [float(v) for v in theta]
+                prediction = np.asarray(compiled(*args), dtype=float).reshape(-1)
+            except Exception:
+                return np.full_like(y_fit, 1e12, dtype=float)
+            if prediction.shape != y_fit.shape or not np.all(np.isfinite(prediction)):
+                return np.full_like(y_fit, 1e12, dtype=float)
+            return prediction - y_fit
+
+        import warnings
+
+        with warnings.catch_warnings(), np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            warnings.simplefilter("ignore", RuntimeWarning)
+            fit = least_squares(
+                residual,
+                x0,
+                loss="soft_l1",
+                max_nfev=max_nfev,
+            )
+        fitted_constants = {
+            str(symbol): float(value) for symbol, value in zip(constants, fit.x)
+        }
+        fitted_expr = template.subs(dict(zip(constants, fit.x)))
+
+    y_pred_fit = equation_session._predict(fitted_expr, X_fit, feature_names)
+    y_pred_train = (
+        np.empty(0, dtype=float)
+        if evaluation_only
+        else equation_session._predict(fitted_expr, X_train, feature_names)
+    )
+    y_pred_val = (
+        np.empty(0, dtype=float)
+        if train_only
+        else equation_session._predict(fitted_expr, X_val, feature_names)
+    )
+    nmse_train = (
+        float("nan")
+        if evaluation_only
+        else _nmse_with_gaussian_smoothed_target(
+            y_train, y_pred_train, X_train, y_reference
+        )
+    )
+    nmse_val = (
+        float("nan")
+        if train_only
+        else _nmse_with_gaussian_smoothed_target(y_val, y_pred_val, X_val, y_reference)
+    )
+    loss = float(np.mean((y_pred_fit - y_fit) ** 2))
+
+    result = {
+        "equation_template": str(template),
+        "equation": str(fitted_expr),
+        "constants": fitted_constants,
+        "loss": loss,
+        "complexity": equation_session._complexity(template),
+        "nmse_train": nmse_train,
+        "nmse_val": nmse_val,
+        "n_val_points": int(len(y_val)),
+        "evaluation_only": evaluation_only,
+        "train_only": train_only,
+        "combined_score": (
+            0.0
+            if train_only or not np.isfinite(nmse_val)
+            else combined_score_from_nmse(nmse_val)
+        ),
+    }
+    equation_session._record_scorer_result(result)
+    return result
+
+
+def _point_weighted_mean(
+    values: list[float],
+    weights: list[int],
+) -> float:
+    """Average values with one weight per evaluation point."""
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return float("inf")
+    weighted = sum(
+        float(value) * float(weight)
+        for value, weight in zip(values, weights)
+        if np.isfinite(float(value))
+    )
+    if not np.isfinite(weighted):
+        return float("inf")
+    return float(weighted / total_weight)
 
 
 def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Aggregate per-dataset metrics without letting failed datasets disappear."""
-    nmse_vals = [r["nmse_val"] for r in per_dataset_results.values()]
+    scoring_results = {
+        name: result
+        for name, result in per_dataset_results.items()
+        if int(result.get("n_val_points", 0)) > 0
+    }
+    raw_nmse_vals = [float(r["nmse_val"]) for r in scoring_results.values()]
+    nmse_vals = list(raw_nmse_vals)
+    train_nmse_vals = [
+        float(r["nmse_train"])
+        for r in per_dataset_results.values()
+        if np.isfinite(float(r.get("nmse_train", float("inf"))))
+    ]
     complexity_vals = []
     for r in per_dataset_results.values():
         try:
@@ -578,7 +838,7 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
     )
     failed_datasets = sorted(
         name
-        for name, result in per_dataset_results.items()
+        for name, result in scoring_results.items()
         if result.get("error") or not np.isfinite(float(result.get("nmse_val", float("inf"))))
     )
     templates = sorted(
@@ -595,6 +855,17 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
             eq_template = r["equation"]
             break
 
+    hard_cases = [
+        {"dataset": name, "nmse_val": float(result["nmse_val"])}
+        for name, result in scoring_results.items()
+        if np.isfinite(float(result.get("nmse_val", float("inf"))))
+    ]
+    hard_cases.sort(key=lambda item: item["nmse_val"], reverse=True)
+    hard_cases = hard_cases[:5]
+    hard_case_feedback = "; ".join(
+        f"{case['dataset']} nmse={case['nmse_val']:.4g}" for case in hard_cases
+    )
+
     violation_error = None
     if violation_errors:
         violation_error = violation_errors[0]
@@ -602,7 +873,7 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         examples = ", ".join(failed_datasets[:3])
         violation_error = (
             "Single-equation violation: candidate failed on "
-            f"{len(failed_datasets)}/{len(per_dataset_results)} datasets. "
+            f"{len(failed_datasets)}/{len(scoring_results)} validation datasets. "
             "Failed datasets are not dropped from the aggregate reward. "
             f"Examples: {examples}"
         )
@@ -617,10 +888,38 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
 
     if violation_error:
         agg_nmse = float("inf")
+        mean_nmse = float("inf")
+        agg_train_nmse = float("inf")
         agg_combined = 0.0
         n_successful = 0
     else:
-        agg_nmse = float(np.mean(nmse_vals)) if nmse_vals else float("inf")
+        val_point_weights = [
+            int(r.get("n_val_points", 0)) for r in scoring_results.values()
+        ]
+        mean_nmse = _point_weighted_mean(nmse_vals, val_point_weights)
+        raw_mean_nmse = _point_weighted_mean(raw_nmse_vals, val_point_weights)
+        eval_only_results = {
+            name: result
+            for name, result in scoring_results.items()
+            if result.get("evaluation_only")
+        }
+        eval_only_nmse_vals = [
+            float(result["nmse_val"])
+            for result in eval_only_results.values()
+            if np.isfinite(float(result.get("nmse_val", float("inf"))))
+        ]
+        eval_only_weights = [
+            int(result.get("n_val_points", 0))
+            for result in eval_only_results.values()
+            if np.isfinite(float(result.get("nmse_val", float("inf"))))
+        ]
+        mean_nmse_eval_only = (
+            _point_weighted_mean(eval_only_nmse_vals, eval_only_weights)
+            if eval_only_nmse_vals
+            else float("nan")
+        )
+        agg_nmse = mean_nmse
+        agg_train_nmse = float(np.mean(train_nmse_vals)) if train_nmse_vals else float("inf")
         raw_combined = (
             float(1.0 / (1.0 + max(agg_nmse, 0.0))) if np.isfinite(agg_nmse) else 0.0
         )
@@ -630,7 +929,10 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
 
     aggregated = {
         "equation": eq_template,
+        "nmse_train": agg_train_nmse,
         "nmse_val": agg_nmse,
+        "mean_nmse_val": mean_nmse,
+        "mean_raw_nmse_val": raw_mean_nmse if not violation_error else float("inf"),
         "combined_score": agg_combined,
         "fit_score": raw_combined if not violation_error else 0.0,
         "complexity": aggregate_complexity,
@@ -638,9 +940,19 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         "parsimony_penalty_factor": (
             _parsimony_penalty_factor(aggregate_complexity) if not violation_error else 1.0
         ),
-        "n_datasets": len(per_dataset_results),
+        "n_datasets": len(scoring_results),
+        "n_total_datasets": len(per_dataset_results),
+        "n_train_only_datasets": len(per_dataset_results) - len(scoring_results),
         "n_successful": n_successful,
+        "n_evaluation_only_datasets": len(
+            [name for name, result in per_dataset_results.items() if result.get("evaluation_only")]
+        ),
+        "mean_nmse_eval_only": (
+            mean_nmse_eval_only if not violation_error else float("inf")
+        ),
         "eval_workers": NUM_WORKERS,
+        "hard_cases": hard_cases,
+        "hard_case_feedback": hard_case_feedback,
         "per_dataset": per_dataset_results,
     }
     if violation_error:
@@ -696,11 +1008,12 @@ try:
     evaluator_spec.loader.exec_module(evaluator)
     evaluator.validate_candidate_source(program_path)
 
+    import pysr_harness.equation_session as equation_session
+    equation_session.evaluate_expression = evaluator.evaluate_symbolic_expression
+    equation_session.nmse = evaluator._nmse_with_gaussian_smoothed_target
     spec = importlib.util.spec_from_file_location("program", program_path)
     program = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(program)
-    import pysr_harness.equation_session as equation_session
-    equation_session.nmse = evaluator._nmse_with_gaussian_smoothed_target
     from pysr_harness.equation_session import (
         single_equation_evaluation,
         validate_single_equation_result,
@@ -721,9 +1034,13 @@ try:
                 result = fn(X_train, y_train, X_val, y_val)
                 validate_single_equation_result(result)
             ds_nmse = float(result.get("nmse_val", float("inf")))
+            ds_train_nmse = float(result.get("nmse_train", float("inf")))
             ds_combined = float(result.get("combined_score", 0.0))
             return ds_name, {{
+                "nmse_train": ds_train_nmse,
                 "nmse_val": ds_nmse,
+                "n_val_points": int(result.get("n_val_points", 0)),
+                "evaluation_only": bool(result.get("evaluation_only", False)),
                 "combined_score": ds_combined,
                 "complexity": float(result.get("complexity", 0.0)),
                 "equation": str(result.get("equation", "")),
@@ -732,7 +1049,10 @@ try:
             }}
         except Exception as exc:
             return ds_name, {{
+                "nmse_train": float("inf"),
                 "nmse_val": float("inf"),
+                "n_val_points": int(len(y_val)),
+                "evaluation_only": bool(X_train.shape[0] == 0 and X_val.shape[0] > 0),
                 "combined_score": 0.0,
                 "error": str(exc),
             }}
@@ -796,8 +1116,10 @@ def _metrics_from_result(result: dict, eval_time: float) -> dict:
         "equation": str(result.get("equation", "")),
         "loss": nmse_val,
         "complexity": float(result.get("complexity", 0.0)),
-        "nmse_train": float("inf"),
+        "nmse_train": float(result.get("nmse_train", float("inf"))),
         "nmse_val": nmse_val,
+        "mean_nmse_val": float(result.get("mean_nmse_val", nmse_val)),
+        "mean_raw_nmse_val": float(result.get("mean_raw_nmse_val", nmse_val)),
         "combined_score": combined,
         "fit_score": float(result.get("fit_score", combined)),
         "parsimony_weight": float(result.get("parsimony_weight", PARSIMONY_WEIGHT)),
@@ -806,6 +1128,8 @@ def _metrics_from_result(result: dict, eval_time: float) -> dict:
         "n_datasets": result.get("n_datasets", 0),
         "n_successful": result.get("n_successful", 0),
         "eval_workers": result.get("eval_workers", NUM_WORKERS),
+        "hard_cases": result.get("hard_cases", []),
+        "hard_case_feedback": str(result.get("hard_case_feedback", "")),
         "per_dataset": result.get("per_dataset", {}),
         "error": str(result.get("error", "")),
     }
@@ -820,12 +1144,16 @@ def evaluate(program_path: str) -> dict:
         print(
             "Evaluation: "
             f"nmse_val={metrics['nmse_val']:.6f}, "
+            f"mean_nmse_val={metrics['mean_nmse_val']:.6f}, "
+            f"mean_raw_nmse_val={metrics['mean_raw_nmse_val']:.6f}, "
             f"combined_score={metrics['combined_score']:.6f}, "
             f"n_datasets={metrics['n_datasets']}, "
             f"n_successful={metrics['n_successful']}, "
             f"time={metrics['eval_time']:.2f}s"
         )
         print(f"Equation template: {metrics['equation']}")
+        if metrics.get("hard_case_feedback"):
+            print(f"Hard-case feedback: {metrics['hard_case_feedback']}")
         if metrics.get("error"):
             print(f"Evaluator feedback: {metrics['error']}")
         return metrics
@@ -838,10 +1166,14 @@ def evaluate(program_path: str) -> dict:
             "complexity": 0.0,
             "nmse_train": float("inf"),
             "nmse_val": float("inf"),
+            "mean_nmse_val": float("inf"),
+            "mean_raw_nmse_val": float("inf"),
             "combined_score": 0.0,
             "eval_time": 0.0,
             "n_datasets": 0,
             "n_successful": 0,
+            "hard_cases": [],
+            "hard_case_feedback": "",
             "per_dataset": {},
             "error": str(exc),
         }
@@ -854,11 +1186,12 @@ def _eval_stage1_worker(args):
     if harness_root not in sys.path:
         sys.path.insert(0, harness_root)
     validate_candidate_source(program_path)
+    import pysr_harness.equation_session as equation_session
+    equation_session.evaluate_expression = evaluate_symbolic_expression
+    equation_session.nmse = _nmse_with_gaussian_smoothed_target
     spec = importlib.util.spec_from_file_location("program", program_path)
     program = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(program)
-    import pysr_harness.equation_session as equation_session
-    equation_session.nmse = _nmse_with_gaussian_smoothed_target
     from pysr_harness.equation_session import (
         single_equation_evaluation,
         validate_single_equation_result,
@@ -869,11 +1202,9 @@ def _eval_stage1_worker(args):
     )
     if fn is None:
         return 0.0, "missing evaluate_symbolic_candidate()", ""
-    n = min(200, len(X_train))
-    m = min(80, len(X_val))
     try:
         with single_equation_evaluation():
-            result = fn(X_train[:n], y_train[:n], X_val[:m], y_val[:m])
+            result = fn(X_train, y_train, X_val, y_val)
             validate_single_equation_result(result)
         return float(result.get("combined_score", 0.0)), None, str(
             result.get("equation_template", "")
@@ -890,12 +1221,17 @@ def evaluate_stage1(program_path: str) -> dict:
             sys.path.insert(0, harness_root)
 
         all_datasets = load_all_datasets()
+        scoring_datasets = [
+            dataset
+            for dataset in all_datasets
+            if dataset[0] not in EVALUATION_ONLY_DATASETS and dataset[4].size > 0
+        ]
         rng = np.random.default_rng(RANDOM_STATE)
-        if len(all_datasets) > 8:
-            indices = rng.choice(len(all_datasets), size=8, replace=False)
-            subset = [all_datasets[i] for i in sorted(indices)]
+        if len(scoring_datasets) > 8:
+            indices = rng.choice(len(scoring_datasets), size=8, replace=False)
+            subset = [scoring_datasets[i] for i in sorted(indices)]
         else:
-            subset = all_datasets
+            subset = scoring_datasets
 
         work_items = [
             (name, X_train, X_val, y_train, y_val, program_path)
@@ -962,6 +1298,7 @@ def evaluate_stage1(program_path: str) -> dict:
             "n_stage1_datasets": len(subset),
             "n_stage1_successful": len(successful_scores),
             "eval_workers": NUM_WORKERS,
+            "stage1_full_selected_datasets": 1.0,
         }
     except Exception as exc:
         print(f"Stage 1 evaluation failed: {exc}")

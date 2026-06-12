@@ -1,4 +1,4 @@
-# PySR symbolic benchmark: Universal amyloid aggregation kinetics
+# PySR symbolic benchmark: Normalized universal amyloid aggregation kinetics
 # Multi-dataset fitting across ALL disease-relevant non-inhibited proteins
 # Usage: skydiscover-run initial_program.py evaluator.py -c config.yaml -s adaevolve|evox
 
@@ -25,21 +25,38 @@ prompt:
     You are an expert in robust symbolic model discovery.
 
     ## Multi-Dataset Task
-    You are searching for one symbolic expression template that predicts a
-    rescaled response across ~60 disease-relevant, non-inhibited protein
-    aggregation datasets. All datasets live under:
+    You are searching for one symbolic expression template for
+    disease-relevant, non-inhibited protein aggregation datasets. All datasets
+    live under:
       /home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited/
 
-    Each dataset is a `fit.tsv` file (wide table, rescaled 0→1) with:
-    - x0 = measurement time coordinate (X column)
+    Each dataset is a `fit.tsv` file (wide table). The evaluator normalizes
+    every dataset before fitting:
+    - x0 = min-max normalized measurement time coordinate
     - x1 = varying experimental parameter extracted from column headers;
-      sequential index if non-numeric
-    - y  = rescaled response (0 to 1)
+      concentration-like values only, left in parsed raw units
+    - y  = response/concentration min-max normalized globally across the
+      whole fit.tsv response table
 
-    **Key constraint:** The equation STRUCTURE must be identical across all
-    datasets, but a separate set of constants is fitted independently for
-    each dataset. This means the expression should capture reusable structure
-    while fitted constants adapt to each dataset.
+    Many source files are already response-rescaled to 0→1. The evaluator uses
+    the same global per-dataset min-max normalization, so those files remain on
+    the same scale while unnormalized files are brought to the same range.
+
+    Splits separate constant fitting from NMSE evaluation:
+    - datasets with 3 or more parameter curves hold out whole x1 curves for
+      validation; remaining curves stay entirely in the train split;
+    - datasets with fewer than 3 parameter curves use all points for constant
+      fitting only and do not contribute validation NMSE to the aggregate score;
+    - eleven designated cross-protein evaluation datasets keep all points in
+      validation only (empty train split): five with 1 curve, one with 2 curves,
+      one with 4 curves, one with 5 curves, one with 6 curves, one with 10
+      curves, and one with 11 curves. Constants for these datasets are fitted
+      on their validation points at scoring time.
+
+    **Key constraint:** The equation structure must be identical across all
+    datasets, but a separate set of constants is fitted independently for each
+    dataset. This means the expression should capture reusable structure while
+    fitted constants adapt to each dataset.
 
     **Hard single-equation rule:** Your EVOLVE-BLOCK must build exactly one
     symbolic expression template and submit it exactly once via
@@ -49,8 +66,8 @@ prompt:
     sweeps, or "best-of" selection logic. That is reward hacking for this task.
     The evaluator will reject these programs with combined_score = 0 and return
     a "Single-equation violation" error so you can correct it. You may use
-    intermediate subexpressions like `rate`, `half_time`, `plateau`, and
-    `baseline`, but there must be one final `expression` and one scorer call.
+    intermediate subexpressions like `rate`, `plateau`, and `growth`, but there
+    must be one final `expression` and one scorer call.
     Return the dictionary from that single `evaluate_expression(...)` call
     directly and unchanged. Do not edit, wrap, replace, or fabricate metrics.
     The evaluator statically checks your source before importing it: the
@@ -60,9 +77,20 @@ prompt:
     ## Objective
     Improve mean validation NMSE across all datasets while keeping the symbolic
     expression compact. Higher `combined_score` means lower mean validation
-    NMSE, with a bounded 20% parsimony penalty for more complex expressions:
+    NMSE. Validation errors are normalized by the full train+validation response
+    variance for that dataset.
 
-        fit_score = 1 / (1 + mean_nmse)
+    Each validation point counts equally in the aggregate reward. Datasets with
+    more held-out validation curves therefore contribute proportionally more:
+
+        per_dataset_loss = dataset_nmse
+        scored_nmse = sum(per_dataset_loss * n_val_points) / sum(n_val_points)
+
+    Hard-case datasets are still reported in evaluator feedback so you can
+    target outliers. Higher `combined_score` then applies a bounded 20% parsimony penalty for
+    more complex expressions:
+
+        fit_score = 1 / (1 + scored_nmse)
         combined_score = fit_score * parsimony_penalty_factor
 
     A candidate that fails on any dataset is penalized heavily, so robustness
@@ -160,6 +188,7 @@ prompt:
 
     Use `pysr_harness.equation_session` helpers:
     - `feature_symbols(n)` → PySR variables `x0`, `x1`, ...
+      Here x0 is normalized time and x1 is the experimental parameter.
     - `constant_symbols(n)` → tunable constants `c0`, `c1`, ...
     - `evaluate_expression(expr, X_train, y_train, X_val, y_val, constants=...)`
       fits constants via least-squares and returns scored metrics.

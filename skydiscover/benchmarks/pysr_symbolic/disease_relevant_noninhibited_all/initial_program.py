@@ -1,5 +1,5 @@
 # EVOLVE-BLOCK-START
-"""Symbolic regression seed for multi-dataset amyloid aggregation kinetics."""
+"""Symbolic regression seed for normalized multi-dataset amyloid aggregation kinetics."""
 
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ def evaluate_symbolic_candidate(
     universal kinetic mechanism while the constants adapt to each protein
     system's specific rates, concentrations, and timescales.
 
-    Features: x0 = elapsed time, x1 = varying experimental parameter
-    (concentration, pH, etc.).
+    Features: x0 = normalized elapsed time, x1 = concentration-like
+    experimental parameter parsed from curve headers.
 
     Logistic/sigmoidal template with concentration-dependent rate and
     half-time — a natural model for nucleation-dependent polymerization:

@@ -45,16 +45,31 @@ _base_nmse = _metrics_mod.nmse
 DATA_ROOT = Path("/home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited")
 RANDOM_STATE = 42
 TEST_SIZE = 0.35
-CONTIGUOUS_VAL_BLOCK_SIZE = 10
+# Entire fit.tsv datasets held out for cross-protein evaluation: all points go to
+# validation and constants are fitted on that validation data at scoring time.
+EVALUATION_ONLY_DATASETS = frozenset(
+    {
+        # Multi-curve cross-protein holdouts
+        "Abeta/Cohen2013/Ab42_sec_IN_HOURS",  # 10 parameter curves
+        "Abeta/Meisl2014/Ab40_sec_IN_HOURS",  # 11 parameter curves
+        "htt/Kakkar2016/FIts/Kakkar2016_6kDa_polyQ_prim",  # 4 parameter curves
+        "htt/Kar2011/Fits/Kar2011_Q30_without_lowest_conc_sec",  # 5 parameter curves
+        "biofilm proteins/CsgA/CsgA_prim_IN_HOURS",  # 6 parameter curves
+        "biofilm proteins/RdlB_Yang2017/Fits/5and20uM_prim",  # 2 parameter curves
+        # Single-curve cross-protein holdouts
+        "IAPP/Daval2010/Fits/Daval2010_prim",
+        "IAPP/Daval2010/Fits/Daval2010_sec",
+        "hnRNPA/Kim2013/Fits/Kim2013_A1_prim",
+        "insulin/Fits/Nielsen2001_seeded_sec",
+        "lysozyme/Fits/Hasecke2018_7uM_sec",
+    }
+)
 GAUSSIAN_SMOOTH_SIGMA = float(os.environ.get("SKYDISCOVER_GAUSSIAN_SMOOTH_SIGMA", "1.0"))
 ODE_MULTISTART_SCALES = tuple(
     float(value)
     for value in os.environ.get("SKYDISCOVER_ODE_MULTISTART_SCALES", "1.0,0.3,3.0").split(",")
     if value.strip()
 )
-PER_DATASET_NMSE_CAP = float(os.environ.get("SKYDISCOVER_PER_DATASET_NMSE_CAP", "10.0"))
-HARD_CASE_TAIL_WEIGHT = float(os.environ.get("SKYDISCOVER_HARD_CASE_TAIL_WEIGHT", "0.0"))
-HARD_CASE_TAIL_COUNT = int(os.environ.get("SKYDISCOVER_HARD_CASE_TAIL_COUNT", "3"))
 SINGLE_EQUATION_ERROR_PREFIX = "Single-equation violation"
 _ALLOWED_IMPORTS = {"sympy", "numpy"}
 _ALLOWED_FROM_IMPORTS = {
@@ -509,123 +524,63 @@ def discover_datasets(root: Path = DATA_ROOT) -> list[tuple[str, Path]]:
     return datasets
 
 
-def _place_non_overlapping_blocks(
-    n_points: int,
-    block_sizes: list[int],
-    rng: np.random.Generator,
-) -> set[int] | None:
-    """Place contiguous blocks at random non-overlapping positions."""
-    val_local: set[int] = set()
-    for block_size in block_sizes:
-        valid_starts = [
-            start
-            for start in range(0, n_points - block_size + 1)
-            if not set(range(start, start + block_size)) & val_local
-        ]
-        if not valid_starts:
-            return None
-        start = int(valid_starts[int(rng.integers(len(valid_starts)))])
-        val_local.update(range(start, start + block_size))
-    return val_local
-
-
-def _scatter_points(
-    available: list[int],
-    n_scatter: int,
-    rng: np.random.Generator,
-) -> set[int]:
-    """Pick scattered validation points from unused curve indices."""
-    if n_scatter <= 0 or not available:
-        return set()
-    chosen = rng.choice(np.asarray(available, dtype=int), size=n_scatter, replace=False)
-    return {int(index) for index in np.atleast_1d(chosen)}
-
-
-def _contiguous_point_holdout(
-    ordered_idx: np.ndarray,
-    rng: np.random.Generator,
-) -> tuple[list[int], list[int]]:
-    """Hold out ~TEST_SIZE points as 10-point blocks plus scattered remainder."""
-    n_points = len(ordered_idx)
-    if n_points == 1:
-        idx = ordered_idx.tolist()
-        return idx, idx
-
-    n_val = min(max(1, int(round(n_points * TEST_SIZE))), n_points - 1)
-    n_full_blocks = n_val // CONTIGUOUS_VAL_BLOCK_SIZE
-    remainder = n_val % CONTIGUOUS_VAL_BLOCK_SIZE
-
-    if n_full_blocks == 0:
-        val_local = _scatter_points(list(range(n_points)), n_val, rng)
-    else:
-        block_sizes = [CONTIGUOUS_VAL_BLOCK_SIZE] * n_full_blocks
-        placement_order = list(block_sizes)
-        rng.shuffle(placement_order)
-        val_local = _place_non_overlapping_blocks(n_points, placement_order, rng)
-        if val_local is None:
-            val_local = _scatter_points(list(range(n_points)), n_val, rng)
-        elif remainder > 0:
-            available = [index for index in range(n_points) if index not in val_local]
-            val_local |= _scatter_points(available, remainder, rng)
-
-    val_indices = [int(ordered_idx[i]) for i in sorted(val_local)]
-    fit_indices = [int(ordered_idx[i]) for i in range(n_points) if i not in val_local]
-    return fit_indices, val_indices
-
-
 def _trajectory_preserving_split(
     X: np.ndarray,
     y: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Split curves/points into fit (train) and NMSE-evaluation (val) sets."""
+    """Split whole parameter curves into fit (train) and NMSE-evaluation (val) sets."""
     parameters = np.unique(X[:, 1])
     rng = np.random.default_rng(RANDOM_STATE)
 
-    if len(parameters) >= 3:
-        shuffled = parameters[rng.permutation(len(parameters))]
-        n_val_curves = min(
-            max(1, int(round(len(parameters) * TEST_SIZE))), len(parameters) - 1
-        )
-        val_params = {float(p) for p in shuffled[:n_val_curves]}
+    if len(parameters) < 3:
+        empty_X = np.empty((0, X.shape[1]), dtype=float)
+        empty_y = np.empty(0, dtype=float)
+        return X, empty_X, y, empty_y
 
-        fit_indices: list[int] = []
-        val_indices: list[int] = []
-        for parameter in parameters:
-            curve_idx = np.flatnonzero(X[:, 1] == parameter)
-            if float(parameter) in val_params:
-                val_indices.extend(curve_idx.tolist())
-                continue
+    shuffled = parameters[rng.permutation(len(parameters))]
+    n_val_curves = min(
+        max(1, int(round(len(parameters) * TEST_SIZE))), len(parameters) - 1
+    )
+    val_params = {float(p) for p in shuffled[:n_val_curves]}
 
-            if len(curve_idx) == 1:
-                fit_indices.extend(curve_idx.tolist())
-                continue
-
-            ordered_idx = curve_idx[np.argsort(X[curve_idx, 0])]
-            curve_fit, curve_val = _contiguous_point_holdout(ordered_idx, rng)
-            fit_indices.extend(curve_fit)
-            val_indices.extend(curve_val)
-
-        fit_idx = np.sort(np.asarray(fit_indices, dtype=int))
-        val_idx = np.sort(np.asarray(val_indices, dtype=int))
-        return X[fit_idx], X[val_idx], y[fit_idx], y[val_idx]
-
-    train_indices: list[int] = []
+    fit_indices: list[int] = []
     val_indices: list[int] = []
     for parameter in parameters:
         curve_idx = np.flatnonzero(X[:, 1] == parameter)
-        ordered_idx = curve_idx[np.argsort(X[curve_idx, 0])]
-        curve_fit, curve_val = _contiguous_point_holdout(ordered_idx, rng)
-        train_indices.extend(curve_fit)
-        val_indices.extend(curve_val)
+        if float(parameter) in val_params:
+            val_indices.extend(curve_idx.tolist())
+        else:
+            fit_indices.extend(curve_idx.tolist())
 
-    train_idx = np.sort(np.asarray(train_indices, dtype=int))
+    fit_idx = np.sort(np.asarray(fit_indices, dtype=int))
     val_idx = np.sort(np.asarray(val_indices, dtype=int))
-    return X[train_idx], X[val_idx], y[train_idx], y[val_idx]
+    return X[fit_idx], X[val_idx], y[fit_idx], y[val_idx]
 
 
-def load_dataset(data_file: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _evaluation_only_split(
+    X: np.ndarray,
+    y: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Hold out an entire dataset for validation-only cross-protein evaluation."""
+    empty_X = np.empty((0, X.shape[1]), dtype=float)
+    empty_y = np.empty(0, dtype=float)
+    return empty_X, X, empty_y, y
+
+
+def _dataset_name_from_path(data_file: Path, root: Path = DATA_ROOT) -> str:
+    return str(data_file.parent.relative_to(root)).replace(os.sep, "/")
+
+
+def load_dataset(
+    data_file: Path,
+    *,
+    dataset_name: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load a single fit.tsv and return deterministic trajectory-preserving split."""
     X, y = _load_fit_table(data_file)
+    name = dataset_name or _dataset_name_from_path(data_file)
+    if name in EVALUATION_ONLY_DATASETS:
+        return _evaluation_only_split(X, y)
     return _trajectory_preserving_split(X, y)
 
 
@@ -637,7 +592,7 @@ def load_all_datasets(
     results = []
     for name, path in entries:
         try:
-            X_train, X_val, y_train, y_val = load_dataset(path)
+            X_train, X_val, y_train, y_val = load_dataset(path, dataset_name=name)
             results.append((name, X_train, X_val, y_train, y_val))
         except Exception as exc:
             print(f"Warning: skipping dataset {name}: {exc}")
@@ -713,10 +668,7 @@ def _nmse_with_gaussian_smoothed_target(
     reference_values: np.ndarray | None = None,
 ) -> float:
     reference = y_true if reference_values is None else reference_values
-    raw_loss = _normalized_mse_with_reference_variance(y_true, y_pred, reference)
-    smooth_target = _curve_smoothed_target(X, y_true) if X is not None else _gaussian_smooth_1d(y_true)
-    smooth_loss = _normalized_mse_with_reference_variance(smooth_target, y_pred, reference)
-    return float((raw_loss + smooth_loss) / 2.0)
+    return _normalized_mse_with_reference_variance(y_true, y_pred, reference)
 
 
 def _ode_predictions(
@@ -789,13 +741,20 @@ def evaluate_ode_expression(
     y_train = np.asarray(y_train, dtype=float).reshape(-1)
     X_val = np.asarray(X_val, dtype=float)
     y_val = np.asarray(y_val, dtype=float).reshape(-1)
-    y_reference = np.concatenate([y_train, y_val])
-    feature_names = [f"x{i}" for i in range(X_train.shape[1])]
+    evaluation_only = X_train.shape[0] == 0 and X_val.shape[0] > 0
+    train_only = X_val.shape[0] == 0 and X_train.shape[0] > 0
+    if evaluation_only:
+        X_fit, y_fit = X_val, y_val
+    else:
+        X_fit, y_fit = X_train, y_train
+    y_reference = np.concatenate([y_train, y_val]) if y_train.size else y_val
+    n_features = X_fit.shape[1] if X_fit.shape[0] else X_val.shape[1]
+    feature_names = [f"x{i}" for i in range(n_features)]
     template = equation_session._as_sympy_expr(expression, feature_names)
     equation_session._record_scored_template(template)
 
     if constants is None:
-        feature_set = set(equation_session.feature_symbols(X_train.shape[1]))
+        feature_set = set(equation_session.feature_symbols(n_features))
         constants = sorted(template.free_symbols - feature_set, key=lambda s: s.name)
     constants = list(constants)
     equation_session._validate_expression_template(template, constants)
@@ -807,38 +766,52 @@ def evaluate_ode_expression(
         if base_x0.size != len(constants):
             raise ValueError("initial_values must match the number of constants")
 
-    feature_syms = equation_session.feature_symbols(X_train.shape[1])
+    feature_syms = equation_session.feature_symbols(n_features)
     rhs_fn = sp.lambdify(feature_syms + constants, template, modules=["numpy"])
 
     if not constants:
-        y_pred_train = _ode_predictions(rhs_fn, X_train, y_train, np.asarray([], dtype=float))
+        y_pred_fit = _ode_predictions(rhs_fn, X_fit, y_fit, np.asarray([], dtype=float))
         y_pred_val = _ode_predictions(rhs_fn, X_val, y_val, np.asarray([], dtype=float))
-        nmse_train = _nmse_with_gaussian_smoothed_target(
-            y_train, y_pred_train, X_train, y_reference
+        nmse_train = (
+            float("nan")
+            if evaluation_only
+            else _nmse_with_gaussian_smoothed_target(
+                y_train, y_pred_fit, X_train, y_reference
+            )
         )
-        nmse_val = _nmse_with_gaussian_smoothed_target(y_val, y_pred_val, X_val, y_reference)
+        nmse_val = (
+            float("nan")
+            if train_only
+            else _nmse_with_gaussian_smoothed_target(y_val, y_pred_val, X_val, y_reference)
+        )
         result = {
             "equation_template": f"d(c)/dt = {template}",
             "equation": f"d(c)/dt = {template}",
             "constants": {},
-            "loss": float(np.mean((y_pred_train - y_train) ** 2)),
+            "loss": float(np.mean((y_pred_fit - y_fit) ** 2)),
             "complexity": equation_session._complexity(template),
             "nmse_train": nmse_train,
             "nmse_val": nmse_val,
             "n_val_points": int(len(y_val)),
-            "combined_score": combined_score_from_nmse(nmse_val),
+            "evaluation_only": evaluation_only,
+            "train_only": train_only,
+            "combined_score": (
+                0.0
+                if train_only or not np.isfinite(nmse_val)
+                else combined_score_from_nmse(nmse_val)
+            ),
         }
         equation_session._record_scorer_result(result)
         return result
 
     def residual(theta: np.ndarray) -> np.ndarray:
         try:
-            prediction = _ode_predictions(rhs_fn, X_train, y_train, theta)
+            prediction = _ode_predictions(rhs_fn, X_fit, y_fit, theta)
         except Exception:
-            return np.full_like(y_train, 1e12, dtype=float)
-        if prediction.shape != y_train.shape or not np.all(np.isfinite(prediction)):
-            return np.full_like(y_train, 1e12, dtype=float)
-        return prediction - y_train
+            return np.full_like(y_fit, 1e12, dtype=float)
+        if prediction.shape != y_fit.shape or not np.all(np.isfinite(prediction)):
+            return np.full_like(y_fit, 1e12, dtype=float)
+        return prediction - y_fit
 
     initial_candidates: list[np.ndarray] = []
     for scale in ODE_MULTISTART_SCALES or (1.0,):
@@ -873,13 +846,21 @@ def evaluate_ode_expression(
     }
     substitutions = dict(zip(constants, best_fit.x))
     fitted_expr = template.subs(substitutions)
-    y_pred_train = _ode_predictions(rhs_fn, X_train, y_train, best_fit.x)
+    y_pred_fit = _ode_predictions(rhs_fn, X_fit, y_fit, best_fit.x)
     y_pred_val = _ode_predictions(rhs_fn, X_val, y_val, best_fit.x)
-    nmse_train = _nmse_with_gaussian_smoothed_target(
-        y_train, y_pred_train, X_train, y_reference
+    nmse_train = (
+        float("nan")
+        if evaluation_only
+        else _nmse_with_gaussian_smoothed_target(
+            y_train, y_pred_fit, X_train, y_reference
+        )
     )
-    nmse_val = _nmse_with_gaussian_smoothed_target(y_val, y_pred_val, X_val, y_reference)
-    loss = float(np.mean((y_pred_train - y_train) ** 2))
+    nmse_val = (
+        float("nan")
+        if train_only
+        else _nmse_with_gaussian_smoothed_target(y_val, y_pred_val, X_val, y_reference)
+    )
+    loss = float(np.mean((y_pred_fit - y_fit) ** 2))
 
     result = {
         "equation_template": f"d(c)/dt = {template}",
@@ -890,7 +871,13 @@ def evaluate_ode_expression(
         "nmse_train": nmse_train,
         "nmse_val": nmse_val,
         "n_val_points": int(len(y_val)),
-        "combined_score": combined_score_from_nmse(nmse_val),
+        "evaluation_only": evaluation_only,
+        "train_only": train_only,
+        "combined_score": (
+            0.0
+            if train_only or not np.isfinite(nmse_val)
+            else combined_score_from_nmse(nmse_val)
+        ),
     }
     equation_session._record_scorer_result(result)
     return result
@@ -916,8 +903,13 @@ def _point_weighted_mean(
 
 def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Aggregate per-dataset metrics without letting failed datasets disappear."""
-    raw_nmse_vals = [float(r["nmse_val"]) for r in per_dataset_results.values()]
-    nmse_vals = [min(value, PER_DATASET_NMSE_CAP) for value in raw_nmse_vals]
+    scoring_results = {
+        name: result
+        for name, result in per_dataset_results.items()
+        if int(result.get("n_val_points", 0)) > 0
+    }
+    raw_nmse_vals = [float(r["nmse_val"]) for r in scoring_results.values()]
+    nmse_vals = list(raw_nmse_vals)
     train_nmse_vals = [
         float(r["nmse_train"])
         for r in per_dataset_results.values()
@@ -942,7 +934,7 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
     )
     failed_datasets = sorted(
         name
-        for name, result in per_dataset_results.items()
+        for name, result in scoring_results.items()
         if result.get("error") or not np.isfinite(float(result.get("nmse_val", float("inf"))))
     )
     templates = sorted(
@@ -961,18 +953,13 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
 
     hard_cases = [
         {"dataset": name, "nmse_val": float(result["nmse_val"])}
-        for name, result in per_dataset_results.items()
+        for name, result in scoring_results.items()
         if np.isfinite(float(result.get("nmse_val", float("inf"))))
     ]
     hard_cases.sort(key=lambda item: item["nmse_val"], reverse=True)
     hard_cases = hard_cases[:5]
     hard_case_feedback = "; ".join(
         f"{case['dataset']} nmse={case['nmse_val']:.4g}" for case in hard_cases
-    )
-    hard_case_tail_nmse = (
-        float(np.mean([case["nmse_val"] for case in hard_cases[:HARD_CASE_TAIL_COUNT]]))
-        if hard_cases and HARD_CASE_TAIL_COUNT > 0
-        else 0.0
     )
 
     violation_error = None
@@ -982,7 +969,7 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         examples = ", ".join(failed_datasets[:3])
         violation_error = (
             "Single-equation violation: candidate failed on "
-            f"{len(failed_datasets)}/{len(per_dataset_results)} datasets. "
+            f"{len(failed_datasets)}/{len(scoring_results)} validation datasets. "
             "Failed datasets are not dropped from the aggregate reward. "
             f"Examples: {examples}"
         )
@@ -1003,11 +990,31 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         n_successful = 0
     else:
         val_point_weights = [
-            int(r.get("n_val_points", 0)) for r in per_dataset_results.values()
+            int(r.get("n_val_points", 0)) for r in scoring_results.values()
         ]
         mean_nmse = _point_weighted_mean(nmse_vals, val_point_weights)
         raw_mean_nmse = _point_weighted_mean(raw_nmse_vals, val_point_weights)
-        agg_nmse = mean_nmse + HARD_CASE_TAIL_WEIGHT * hard_case_tail_nmse
+        eval_only_results = {
+            name: result
+            for name, result in scoring_results.items()
+            if result.get("evaluation_only")
+        }
+        eval_only_nmse_vals = [
+            float(result["nmse_val"])
+            for result in eval_only_results.values()
+            if np.isfinite(float(result.get("nmse_val", float("inf"))))
+        ]
+        eval_only_weights = [
+            int(result.get("n_val_points", 0))
+            for result in eval_only_results.values()
+            if np.isfinite(float(result.get("nmse_val", float("inf"))))
+        ]
+        mean_nmse_eval_only = (
+            _point_weighted_mean(eval_only_nmse_vals, eval_only_weights)
+            if eval_only_nmse_vals
+            else float("nan")
+        )
+        agg_nmse = mean_nmse
         agg_train_nmse = float(np.mean(train_nmse_vals)) if train_nmse_vals else float("inf")
         raw_combined = (
             float(1.0 / (1.0 + max(agg_nmse, 0.0))) if np.isfinite(agg_nmse) else 0.0
@@ -1029,14 +1036,19 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         "parsimony_penalty_factor": (
             _parsimony_penalty_factor(aggregate_complexity) if not violation_error else 1.0
         ),
-        "n_datasets": len(per_dataset_results),
+        "n_datasets": len(scoring_results),
+        "n_total_datasets": len(per_dataset_results),
+        "n_train_only_datasets": len(per_dataset_results) - len(scoring_results),
         "n_successful": n_successful,
+        "n_evaluation_only_datasets": len(
+            [name for name, result in per_dataset_results.items() if result.get("evaluation_only")]
+        ),
+        "mean_nmse_eval_only": (
+            mean_nmse_eval_only if not violation_error else float("inf")
+        ),
         "eval_workers": NUM_WORKERS,
         "hard_cases": hard_cases,
         "hard_case_feedback": hard_case_feedback,
-        "hard_case_tail_nmse": hard_case_tail_nmse,
-        "hard_case_tail_weight": HARD_CASE_TAIL_WEIGHT,
-        "per_dataset_nmse_cap": PER_DATASET_NMSE_CAP,
         "per_dataset": per_dataset_results,
     }
     if violation_error:
@@ -1124,6 +1136,7 @@ try:
                 "nmse_train": ds_train_nmse,
                 "nmse_val": ds_nmse,
                 "n_val_points": int(result.get("n_val_points", 0)),
+                "evaluation_only": bool(result.get("evaluation_only", False)),
                 "combined_score": ds_combined,
                 "complexity": float(result.get("complexity", 0.0)),
                 "equation": str(result.get("equation", "")),
@@ -1134,6 +1147,8 @@ try:
             return ds_name, {{
                 "nmse_train": float("inf"),
                 "nmse_val": float("inf"),
+                "n_val_points": int(len(y_val)),
+                "evaluation_only": bool(X_train.shape[0] == 0 and X_val.shape[0] > 0),
                 "combined_score": 0.0,
                 "error": str(exc),
             }}
@@ -1211,9 +1226,6 @@ def _metrics_from_result(result: dict, eval_time: float) -> dict:
         "eval_workers": result.get("eval_workers", NUM_WORKERS),
         "hard_cases": result.get("hard_cases", []),
         "hard_case_feedback": str(result.get("hard_case_feedback", "")),
-        "hard_case_tail_nmse": float(result.get("hard_case_tail_nmse", 0.0)),
-        "hard_case_tail_weight": float(result.get("hard_case_tail_weight", HARD_CASE_TAIL_WEIGHT)),
-        "per_dataset_nmse_cap": float(result.get("per_dataset_nmse_cap", PER_DATASET_NMSE_CAP)),
         "per_dataset": result.get("per_dataset", {}),
         "error": str(result.get("error", "")),
     }
@@ -1258,9 +1270,6 @@ def evaluate(program_path: str) -> dict:
             "n_successful": 0,
             "hard_cases": [],
             "hard_case_feedback": "",
-            "hard_case_tail_nmse": 0.0,
-            "hard_case_tail_weight": HARD_CASE_TAIL_WEIGHT,
-            "per_dataset_nmse_cap": PER_DATASET_NMSE_CAP,
             "per_dataset": {},
             "error": str(exc),
         }
@@ -1308,12 +1317,17 @@ def evaluate_stage1(program_path: str) -> dict:
             sys.path.insert(0, harness_root)
 
         all_datasets = load_all_datasets()
+        scoring_datasets = [
+            dataset
+            for dataset in all_datasets
+            if dataset[0] not in EVALUATION_ONLY_DATASETS and dataset[4].size > 0
+        ]
         rng = np.random.default_rng(RANDOM_STATE)
-        if len(all_datasets) > 8:
-            indices = rng.choice(len(all_datasets), size=8, replace=False)
-            subset = [all_datasets[i] for i in sorted(indices)]
+        if len(scoring_datasets) > 8:
+            indices = rng.choice(len(scoring_datasets), size=8, replace=False)
+            subset = [scoring_datasets[i] for i in sorted(indices)]
         else:
-            subset = all_datasets
+            subset = scoring_datasets
 
         work_items = [
             (name, X_train, X_val, y_train, y_val, program_path)

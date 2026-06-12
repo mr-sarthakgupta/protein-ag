@@ -45,11 +45,14 @@ prompt:
 
     Splits separate constant fitting from NMSE evaluation:
     - datasets with 3 or more parameter curves hold out whole x1 curves for
-      validation and also hold out 35% of points from the remaining train curves
-      for NMSE as contiguous 10-point time segments plus any remainder points
-      scattered on the curve;
-    - datasets with fewer than 3 parameter curves use the same contiguous 35%
-      point holdout for NMSE.
+      validation; remaining curves stay entirely in the train split;
+    - datasets with fewer than 3 parameter curves use all points for constant
+      fitting only and do not contribute validation NMSE to the aggregate score;
+    - eleven designated cross-protein evaluation datasets keep all points in
+      validation only (empty train split): five with 1 curve, one with 2 curves,
+      one with 4 curves, one with 5 curves, one with 6 curves, one with 10
+      curves, and one with 11 curves. Constants for these datasets are fitted
+      on their validation points at scoring time.
 
     **Key constraint:** The ODE structure must be identical across all
     datasets, but a separate set of constants is fitted independently for each
@@ -76,19 +79,17 @@ prompt:
     Improve mean validation NMSE across all datasets while keeping the symbolic
     differential equation compact. Higher `combined_score` means lower mean
     validation NMSE after integrating the ODE with `scipy.integrate.odeint`.
-    Target smoothing is applied curve-wise in time order. Validation errors are
-    normalized by the full train+validation response variance for that dataset,
-    not by the often-flat held-out segment alone.
+    Validation errors are normalized by the full train+validation response
+    variance for that dataset.
 
     Each validation point counts equally in the aggregate reward. Datasets with
-    more held-out points therefore contribute proportionally more:
+    more held-out validation curves therefore contribute proportionally more:
 
-        per_dataset_loss = min(dataset_nmse, 10.0)
+        per_dataset_loss = dataset_nmse
         scored_nmse = sum(per_dataset_loss * n_val_points) / sum(n_val_points)
 
     Hard-case datasets are still reported in evaluator feedback so you can
-    target outliers, but by default they do not receive extra reward weight.
-    Higher `combined_score` then applies a bounded 20% parsimony penalty for
+    target outliers. Higher `combined_score` then applies a bounded 20% parsimony penalty for
     more complex expressions:
 
         fit_score = 1 / (1 + scored_nmse)
