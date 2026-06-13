@@ -107,7 +107,7 @@ def prepare_assets() -> dict:
         "target": {
             "name": "human interleukin-7 receptor alpha ectodomain",
             "chain_id": "B",
-            "proteina_target_input": "B",
+            "proteina_target_input": f"B{residues[0]['res_id']}-{residues[-1]['res_id']}",
             "target_pdb": target_pdb.name,
             "modeled_residue_count_chain_b": len(residues),
             "allowed_hotspots": allowed_hotspots,
