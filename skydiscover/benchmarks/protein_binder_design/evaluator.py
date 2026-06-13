@@ -18,19 +18,28 @@ from pathlib import Path
 from typing import Any
 
 BENCHMARK_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BENCHMARK_DIR.parents[2]
 ASSETS_DIR = BENCHMARK_DIR / "assets"
 TARGET_METADATA_PATH = ASSETS_DIR / "target_metadata.json"
 TARGET_NAME = "SKY_3DI3_IL7RA"
-PROTEINA_ROOT = Path(os.environ.get("PROTEINA_COMPLEXA_ROOT", "/home/mrsar/protein-ag/Proteina-Complexa"))
+PROTEINA_ROOT = Path(
+    os.environ.get("PROTEINA_COMPLEXA_ROOT", str(REPO_ROOT / "Proteina-Complexa"))
+).expanduser()
 PROTEINA_CONFIG_NAME = "search_binder_local_pipeline"
+PROTEINA_CONFIG_DIR = PROTEINA_ROOT / "configs"
+PROTEINA_PYTHON = Path(
+    os.environ.get("PROTEINA_PYTHON", sys.executable)
+).expanduser()
 DEFAULT_TIMEOUT_SECONDS = 7200
 
 _FORBIDDEN_CALLS = {"eval", "exec", "compile", "open", "__import__", "input"}
 _ALLOWED_IMPORT_MODULES = {"__future__", "typing"}
 _ALLOWED_SEARCH_ALGORITHMS = {"single-pass", "best-of-n", "beam-search", "fk-steering", "mcts"}
 _ALLOWED_CHECKPOINT_ALIASES = {"complexa_default": "complexa.ckpt", "complexa": "complexa.ckpt"}
-_ALLOWED_SCHEDULE_MODES = {"log", "power", "linear"}
-_ALLOWED_NOISE_MODES = {"1/t", "tan", "power", "log", "linear"}
+_ALLOWED_SCHEDULE_MODES = {"log", "power", "uniform"}
+# Must match Proteina get_gt() in product_space_flow_matcher.py — not every string
+# in the upstream config docs is implemented.
+_ALLOWED_NOISE_MODES = {"1/t", "tan", "1-t/t", "1/t2", "1/t1p5", "2/t", "2/t2", "2/t1p5"}
 
 
 class CandidateValidationError(ValueError):
@@ -209,11 +218,23 @@ def _normalise_spec(raw: dict[str, Any], *, stage: str) -> dict[str, Any]:
     else:
         nsteps = min(nsteps, _as_int(os.environ.get("SKYDISCOVER_BINDER_MAX_NSTEPS", 120), "max_nsteps", 10, 400))
 
+    stage2_batch_cap = _as_int(os.environ.get("SKYDISCOVER_BINDER_STAGE2_BATCH_SIZE", 2), "stage2_batch_cap", 1, 8)
+    stage2_length_cap = _as_int(
+        os.environ.get("SKYDISCOVER_BINDER_STAGE2_NUM_LENGTH_SAMPLES", 2),
+        "stage2_length_cap",
+        1,
+        8,
+    )
+    stage2_replica_cap = _as_int(os.environ.get("SKYDISCOVER_BINDER_STAGE2_REPLICAS", 2), "stage2_replica_cap", 1, 8)
+
     batch_size = _as_int(raw.get("batch_size", 2), "batch_size", 1, 8)
     num_length_samples = _as_int(raw.get("num_length_samples", 2), "num_length_samples", 1, 8)
     if stage == "stage1":
         batch_size = min(batch_size, 1)
         num_length_samples = min(num_length_samples, 1)
+    else:
+        batch_size = min(batch_size, stage2_batch_cap)
+        num_length_samples = min(num_length_samples, stage2_length_cap)
 
     best_of_n = search.get("best_of_n", {}) if isinstance(search.get("best_of_n", {}), dict) else {}
     beam_search = search.get("beam_search", {}) if isinstance(search.get("beam_search", {}), dict) else {}
@@ -296,6 +317,12 @@ def _normalise_spec(raw: dict[str, Any], *, stage: str) -> dict[str, Any]:
         spec["search"]["fk_steering"]["n_branch"] = min(spec["search"]["fk_steering"]["n_branch"], 1)
         spec["search"]["fk_steering"]["beam_width"] = min(spec["search"]["fk_steering"]["beam_width"], 1)
         spec["search"]["mcts"]["n_simulations"] = min(spec["search"]["mcts"]["n_simulations"], 2)
+    else:
+        spec["search"]["best_of_n"]["replicas"] = min(spec["search"]["best_of_n"]["replicas"], stage2_replica_cap)
+        spec["search"]["beam_search"]["n_branch"] = min(spec["search"]["beam_search"]["n_branch"], stage2_replica_cap)
+        spec["search"]["beam_search"]["beam_width"] = min(spec["search"]["beam_search"]["beam_width"], stage2_replica_cap)
+        spec["search"]["fk_steering"]["n_branch"] = min(spec["search"]["fk_steering"]["n_branch"], stage2_replica_cap)
+        spec["search"]["fk_steering"]["beam_width"] = min(spec["search"]["fk_steering"]["beam_width"], stage2_replica_cap)
     return spec
 
 
@@ -318,11 +345,18 @@ def _build_overrides(spec: dict[str, Any], root_path: Path) -> list[str]:
     ckpt_root, ckpt_name, ae_file = _resolve_checkpoint(spec)
     sampling = spec["sampling"]
     search = spec["search"]
-    max_batch_size = max(
+    computed_max_batch = max(
         spec["batch_size"],
-        spec["batch_size"] * search["best_of_n"]["replicas"],
-        spec["batch_size"] * search["beam_search"]["n_branch"] * search["beam_search"]["beam_width"],
+        spec["batch_size"] * spec["num_length_samples"],
+        spec["batch_size"] * spec["num_length_samples"] * search["best_of_n"]["replicas"],
+        spec["batch_size"]
+        * search["beam_search"]["n_branch"]
+        * search["beam_search"]["beam_width"],
     )
+    # Cap peak GPU memory on consumer GPUs (e.g. 24 GB).  When max_batch_size is
+    # too large, BestOfN skips chunking and runs the full expanded batch at once.
+    max_batch_cap = _as_int(os.environ.get("SKYDISCOVER_BINDER_MAX_BATCH_SIZE", 4), "max_batch_cap", 1, 32)
+    max_batch_size = min(computed_max_batch, max_batch_cap)
 
     return [
         f"++root_path={root_path}",
@@ -416,17 +450,19 @@ def _run_proteina_generate(spec: dict[str, Any], *, stage: str) -> dict[str, Any
         root_path = Path(tmp) / "generation"
         root_path.mkdir(parents=True, exist_ok=True)
         cmd = [
-            sys.executable,
+            str(PROTEINA_PYTHON),
             "-m",
             "proteinfoundation.generate",
             "--config-path",
-            "configs",
+            str(PROTEINA_CONFIG_DIR),
             "--config-name",
             PROTEINA_CONFIG_NAME,
             *_build_overrides(spec, root_path),
         ]
         env = os.environ.copy()
         env["HYDRA_FULL_ERROR"] = "1"
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         src_path = str(PROTEINA_ROOT / "src")
         env["PYTHONPATH"] = src_path + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
 

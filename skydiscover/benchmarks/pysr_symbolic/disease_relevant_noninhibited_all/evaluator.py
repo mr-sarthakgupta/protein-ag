@@ -42,7 +42,11 @@ _metrics_spec.loader.exec_module(_metrics_mod)
 combined_score_from_nmse = _metrics_mod.combined_score_from_nmse
 _base_nmse = _metrics_mod.nmse
 
-DATA_ROOT = Path("/home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited")
+REPO_ROOT = BENCHMARK_DIR.parents[3]
+_DATA_SUBPATH = Path("past-published-data") / "disease-relevant non-inhibited"
+DATA_ROOT = Path(
+    os.environ.get("PROTEIN_AG_DATA_ROOT", str(REPO_ROOT / _DATA_SUBPATH))
+).expanduser()
 RANDOM_STATE = 42
 TEST_SIZE = 0.25
 GAUSSIAN_SMOOTH_SIGMA = float(os.environ.get("SKYDISCOVER_GAUSSIAN_SMOOTH_SIGMA", "1.0"))

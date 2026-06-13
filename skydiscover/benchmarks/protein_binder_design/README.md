@@ -33,11 +33,9 @@ reproducibility.
 
 ## Environment
 
-The evaluator expects Proteina-Complexa at:
-
-```bash
-/home/mrsar/protein-ag/Proteina-Complexa
-```
+The evaluator expects Proteina-Complexa at the sibling directory
+`../Proteina-Complexa` relative to the `skydiscover/` checkout (that is,
+`protein-ag/Proteina-Complexa` when both repos live in the same workspace).
 
 Override with:
 
@@ -61,6 +59,26 @@ For schema-only smoke tests that do not run Proteina:
 ```bash
 export SKYDISCOVER_BINDER_VALIDATE_ONLY=1
 ```
+
+### 24 GB GPU memory limits
+
+Proteina loads Complexa plus AF2 multimer on the same GPU. On cards with ~24 GB
+VRAM (e.g. RTX 3090), the evaluator caps stage-2 search to avoid OOM:
+
+```bash
+export SKYDISCOVER_BINDER_STAGE2_BATCH_SIZE=2
+export SKYDISCOVER_BINDER_STAGE2_NUM_LENGTH_SAMPLES=2
+export SKYDISCOVER_BINDER_STAGE2_REPLICAS=2
+export SKYDISCOVER_BINDER_MAX_BATCH_SIZE=4
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+`run_protein_binder_design_experiment.sh` and `protein-ag/.env` set these by
+default. Tighten further (e.g. `MAX_BATCH_SIZE=2`) if OOM persists.
+
+Noise schedule modes must match Proteina's implementation: use `1/t` or `tan`
+for `bb_ca_noise` / `local_latents_noise`. Modes like `power` or `log` for
+noise are rejected by the evaluator and would crash Proteina if passed through.
 
 ## Run
 

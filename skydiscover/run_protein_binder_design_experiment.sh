@@ -17,11 +17,58 @@ export BEDROCK_CONNECT_TIMEOUT="${BEDROCK_CONNECT_TIMEOUT:-30}"
 export BEDROCK_READ_TIMEOUT="${BEDROCK_READ_TIMEOUT:-1800}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BENCHMARK_DIR="benchmarks/protein_binder_design"
 BENCHMARK_ROOT="$SCRIPT_DIR/$BENCHMARK_DIR"
-PROTEINA_COMPLEXA_ROOT="${PROTEINA_COMPLEXA_ROOT:-/home/mrsar/protein-ag/Proteina-Complexa}"
+PROTEINA_COMPLEXA_ROOT="${PROTEINA_COMPLEXA_ROOT:-$REPO_ROOT/Proteina-Complexa}"
+
+# Load workspace-level overrides first, then Proteina runtime configuration.
+if [ -f "$REPO_ROOT/.env" ]; then
+    # shellcheck disable=SC1090
+    set -a
+    source "$REPO_ROOT/.env"
+    set +a
+fi
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    # shellcheck disable=SC1090
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+# Proteina env.sh sources .env and maps UV tool paths.
+if [ -f "$PROTEINA_COMPLEXA_ROOT/env.sh" ]; then
+    # shellcheck disable=SC1090
+    set -a
+    source "$PROTEINA_COMPLEXA_ROOT/env.sh" >/dev/null
+    set +a
+elif [ -f "$PROTEINA_COMPLEXA_ROOT/.env" ]; then
+    # shellcheck disable=SC1090
+    set -a
+    source "$PROTEINA_COMPLEXA_ROOT/.env"
+    set +a
+fi
+
+# Canonical paths for this workspace layout.
 export PROTEINA_COMPLEXA_ROOT
+export LOCAL_CODE_PATH="${LOCAL_CODE_PATH:-$PROTEINA_COMPLEXA_ROOT}"
+export CKPT_PATH="${CKPT_PATH:-$PROTEINA_COMPLEXA_ROOT/ckpts}"
+export COMMUNITY_MODELS_PATH="${COMMUNITY_MODELS_PATH:-$PROTEINA_COMPLEXA_ROOT/community_models}"
+export AF2_DIR="${AF2_DIR:-$COMMUNITY_MODELS_PATH/ckpts/AF2}"
+export ESM_DIR="${ESM_DIR:-$COMMUNITY_MODELS_PATH/ckpts/ESM2}"
+export RF3_DIR="${RF3_DIR:-$COMMUNITY_MODELS_PATH/ckpts/RF3}"
+export RF3_CKPT_PATH="${RF3_CKPT_PATH:-$RF3_DIR/rf3_foundry_01_24_latest_remapped.ckpt}"
+export RF3_EXEC_PATH="${RF3_EXEC_PATH:-$PROTEINA_COMPLEXA_ROOT/.venv/bin/rf3}"
+export DATA_PATH="${DATA_PATH:-$PROTEINA_COMPLEXA_ROOT/data}"
+export PROTEINA_PYTHON="${PROTEINA_PYTHON:-$PROTEINA_COMPLEXA_ROOT/.venv/bin/python}"
+export PYTHONPATH="${PROTEINA_COMPLEXA_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
 export SKYDISCOVER_BINDER_TIMEOUT="${SKYDISCOVER_BINDER_TIMEOUT:-9000}"
+# 24 GB GPU defaults: keep stage-2 search small and force BestOfN chunking.
+export SKYDISCOVER_BINDER_STAGE2_BATCH_SIZE="${SKYDISCOVER_BINDER_STAGE2_BATCH_SIZE:-2}"
+export SKYDISCOVER_BINDER_STAGE2_NUM_LENGTH_SAMPLES="${SKYDISCOVER_BINDER_STAGE2_NUM_LENGTH_SAMPLES:-2}"
+export SKYDISCOVER_BINDER_STAGE2_REPLICAS="${SKYDISCOVER_BINDER_STAGE2_REPLICAS:-2}"
+export SKYDISCOVER_BINDER_MAX_BATCH_SIZE="${SKYDISCOVER_BINDER_MAX_BATCH_SIZE:-4}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "============================================================"
 echo "  Protein Binder Design - 3DI3 IL-7Ralpha"
@@ -34,6 +81,10 @@ echo "  Cost budget      : \$$MAX_COST"
 echo "  AWS region       : $AWS_REGION"
 echo "  Benchmark root   : $BENCHMARK_ROOT"
 echo "  Proteina root    : $PROTEINA_COMPLEXA_ROOT"
+echo "  Checkpoint path  : $CKPT_PATH"
+echo "  AF2 params       : $AF2_DIR"
+echo "  Proteina Python  : $PROTEINA_PYTHON"
+echo "  GPU batch caps   : stage2 batch=$SKYDISCOVER_BINDER_STAGE2_BATCH_SIZE length=$SKYDISCOVER_BINDER_STAGE2_NUM_LENGTH_SAMPLES replicas=$SKYDISCOVER_BINDER_STAGE2_REPLICAS max_batch=$SKYDISCOVER_BINDER_MAX_BATCH_SIZE"
 echo ""
 
 # Check Bedrock credentials.
@@ -109,17 +160,24 @@ elif [ ! -f "$PROTEINA_COMPLEXA_ROOT/configs/search_binder_local_pipeline.yaml" 
     runtime_missing=1
 fi
 
-CKPT_ROOT="${CKPT_PATH:-$PROTEINA_COMPLEXA_ROOT/ckpts}"
-if [ ! -f "$CKPT_ROOT/complexa.ckpt" ]; then
-    echo "ERROR: missing checkpoint: $CKPT_ROOT/complexa.ckpt"
+if [ ! -x "$PROTEINA_PYTHON" ]; then
+    echo "ERROR: Proteina Python not found or not executable: $PROTEINA_PYTHON"
     runtime_missing=1
 fi
-if [ ! -f "$CKPT_ROOT/complexa_ae.ckpt" ]; then
-    echo "ERROR: missing checkpoint: $CKPT_ROOT/complexa_ae.ckpt"
+
+if [ ! -f "$CKPT_PATH/complexa.ckpt" ]; then
+    echo "ERROR: missing checkpoint: $CKPT_PATH/complexa.ckpt"
+    runtime_missing=1
+fi
+if [ ! -f "$CKPT_PATH/complexa_ae.ckpt" ]; then
+    echo "ERROR: missing checkpoint: $CKPT_PATH/complexa_ae.ckpt"
     runtime_missing=1
 fi
 if [ -z "${AF2_DIR:-}" ] || [ ! -d "${AF2_DIR:-}" ]; then
     echo "ERROR: AF2_DIR is not set to an existing AlphaFold params directory"
+    runtime_missing=1
+elif [ ! -f "$AF2_DIR/params_model_5_ptm.npz" ]; then
+    echo "ERROR: AF2 params look incomplete under $AF2_DIR"
     runtime_missing=1
 fi
 
@@ -127,7 +185,9 @@ if [ "$runtime_missing" = "1" ]; then
     if [ "$ALLOW_RUNTIME_ASSET_FAIL" = "1" ]; then
         echo "WARNING: runtime asset check failed - continuing because ALLOW_RUNTIME_ASSET_FAIL=1"
     else
-        echo "Set CKPT_PATH and AF2_DIR, or ALLOW_RUNTIME_ASSET_FAIL=1 to bypass this preflight."
+        echo "Set CKPT_PATH and AF2_DIR, or run:"
+        echo "  cd $PROTEINA_COMPLEXA_ROOT && .venv/bin/complexa download --everything"
+        echo "Or set ALLOW_RUNTIME_ASSET_FAIL=1 to bypass this preflight."
         exit 1
     fi
 else

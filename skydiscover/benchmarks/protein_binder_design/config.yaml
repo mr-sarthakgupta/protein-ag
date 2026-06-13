@@ -58,11 +58,12 @@ prompt:
     - `denoising_steps`: 10 to 400. Larger can improve samples but costs more; cascade evaluation caps this for early stages.
     - `self_conditioning`: boolean.
     - `seed`: non-negative integer.
-    - `num_length_samples`: 1 to 8.
-    - `batch_size`: 1 to 8.
+    - `num_length_samples`: 1 to 8. On 24 GB GPUs the evaluator caps stage 2 to 2.
+    - `batch_size`: 1 to 8. On 24 GB GPUs the evaluator caps stage 2 to 2.
     - `sampling`: dict with:
-      - `bb_ca_schedule`, `local_latents_schedule`: `{"mode": "log"|"power"|"linear", "p": 0.05..8.0}`
-      - `bb_ca_noise`, `local_latents_noise`: `{"mode": "1/t"|"tan"|"power"|"log"|"linear", "p": 0.05..8.0}`
+      - `bb_ca_schedule`, `local_latents_schedule`: `{"mode": "log"|"power"|"uniform", "p": 0.05..8.0}`
+      - `bb_ca_noise`, `local_latents_noise`: `{"mode": "1/t"|"tan"|"1-t/t"|"1/t2"|"1/t1p5"|"2/t"|"2/t2"|"2/t1p5", "p": 0.05..8.0}`
+        (do **not** use `power`, `log`, or `linear` for noise — Proteina will crash)
       - `bb_ca_sc_scale_noise`, `local_latents_sc_scale_noise`: 0.0..2.0
       - `bb_ca_sc_scale_score`, `local_latents_sc_scale_score`: 0.0..5.0
     - `search`: dict with:
@@ -91,6 +92,13 @@ prompt:
     - Do not return multiple candidate specs or implement a local search loop.
     - The evaluator will reject invalid residue IDs, unsupported algorithms,
       impossible length ranges, unsafe source code, or missing entry points.
+    - **24 GB GPU memory limits (enforced in evaluator):** stage 2 caps
+      `batch_size` and `num_length_samples` to 2, search replicas/branches to 2,
+      and `max_batch_size` to 4 so Proteina chunks BestOfN batches. Prefer
+      `batch_size=2`, `num_length_samples=2`, `best_of_n.replicas=2` — do not
+      push higher; larger values waste eval time and OOM.
+    - Prefer `best-of-n` or `single-pass`. `fk-steering` is fragile; only use
+      safe noise modes (`1/t`, `tan`).
 
 search:
   share_llm: true
