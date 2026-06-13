@@ -168,7 +168,7 @@ class AgenticGenerator:
                     logger.info(
                         "Agent produced text at step %d (%d files read)", step, len(files_read)
                     )
-                    self._save_trace(trace_log, conversation)
+                    self._save_trace(trace_log, conversation, sys_prompt)
                     return text_content
                 conversation.append(
                     {
@@ -210,14 +210,17 @@ class AgenticGenerator:
                     "result_len": len(result.get("content", "")),
                 })
 
-        self._save_trace(trace_log, conversation)
+        self._save_trace(trace_log, conversation, sys_prompt)
         logger.warning("Agent loop ended without producing code")
         return None
 
-    def _save_trace(self, trace_log: list, conversation: list) -> None:
+    def _save_trace(
+        self, trace_log: list, conversation: list, system_prompt: str
+    ) -> None:
         """Persist the agentic trace to the run reference dir and codebase reference dir."""
         try:
             ts = time.strftime("%Y%m%d_%H%M%S")
+            serialized_conversation = _serialize_conversation(conversation)
             payload = {
                 "timestamp": ts,
                 "available_tools": AVAILABLE_TOOL_NAMES,
@@ -227,7 +230,9 @@ class AgenticGenerator:
                 ),
                 "tool_call_count": len(trace_log),
                 "tool_calls": trace_log,
-                "conversation": _serialize_conversation(conversation),
+                "system_prompt": _serialize_message_content(system_prompt),
+                "conversation": serialized_conversation,
+                "model_inputs": _build_model_inputs(system_prompt, conversation),
             }
             saved_paths = []
 
@@ -770,16 +775,29 @@ def _validate_path(
     return True, resolved, ""
 
 
+def _serialize_message_content(content: str) -> str:
+    """Truncate large message bodies for JSON-safe trace persistence."""
+    if len(content) > 2000:
+        return content[:1000] + f"\n...[{len(content)} chars total]...\n" + content[-500:]
+    return content
+
+
+def _build_model_inputs(
+    system_prompt: str, conversation: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Build the full chat payload sent to the model (system + conversation)."""
+    return [
+        {"role": "system", "content": _serialize_message_content(system_prompt)},
+        *_serialize_conversation(conversation),
+    ]
+
+
 def _serialize_conversation(conversation: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Produce a JSON-safe copy of the conversation (truncate large tool results)."""
     out: List[Dict[str, Any]] = []
     for msg in conversation:
         entry: Dict[str, Any] = {"role": msg.get("role", "")}
-        content = msg.get("content", "")
-        if len(content) > 2000:
-            entry["content"] = content[:1000] + f"\n...[{len(content)} chars total]...\n" + content[-500:]
-        else:
-            entry["content"] = content
+        entry["content"] = _serialize_message_content(msg.get("content", ""))
         if "tool_calls" in msg:
             entry["tool_calls"] = msg["tool_calls"]
         if "tool_call_id" in msg:
