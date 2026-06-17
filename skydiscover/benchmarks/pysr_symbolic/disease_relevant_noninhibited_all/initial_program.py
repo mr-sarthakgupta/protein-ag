@@ -30,8 +30,10 @@ def evaluate_symbolic_candidate(
     universal kinetic mechanism while the constants adapt to each protein
     system's specific rates, concentrations, and timescales.
 
-    Features: x0 = normalized elapsed time, x1 = concentration-like
-    experimental parameter parsed from curve headers.
+    Features: x0 = normalized elapsed time, x1 = m0 initial monomer
+    concentration, x2 = static initial M0 seed/aggregate concentration.
+    Units are ignored by the cleaned-data loader; leading numeric values are
+    used directly.
 
     Logistic/sigmoidal template with concentration-dependent rate and
     half-time — a natural model for nucleation-dependent polymerization:

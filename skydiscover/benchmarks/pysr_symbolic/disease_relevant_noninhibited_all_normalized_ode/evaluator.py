@@ -1,6 +1,6 @@
 """Evaluator for normalized ODE discovery across all disease-relevant non-inhibited proteins.
 
-Discovers all fit.tsv datasets in the source data directory, evaluates a
+Discovers all cleaned data.tsv datasets in the source data directory, evaluates a
 candidate differential equation on each independently (fitting a separate set
 of constants per dataset), and returns an aggregate score.
 """
@@ -42,26 +42,28 @@ _metrics_spec.loader.exec_module(_metrics_mod)
 combined_score_from_nmse = _metrics_mod.combined_score_from_nmse
 _base_nmse = _metrics_mod.nmse
 
-DATA_ROOT = Path("/home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited")
+DATA_ROOT = Path("/home/mrsar/protein-ag/disease-relevant non-inhibited_clean")
 RANDOM_STATE = 42
 TEST_SIZE = 0.35
-# Entire fit.tsv datasets held out for cross-protein evaluation: all points go to
-# validation and constants are fitted on that validation data at scoring time.
+# Entire cleaned data.tsv datasets held out for cross-protein evaluation: all
+# points go to validation and constants are fitted on that validation data at
+# scoring time. This set intentionally contains one 11-curve dataset, one
+# 10-curve dataset, one 6-curve dataset, one 5-curve dataset, one 4-curve
+# dataset, and seven 1-curve datasets.
 EVALUATION_ONLY_DATASETS = frozenset(
     {
-        # Multi-curve cross-protein holdouts
-        "Abeta/Cohen2013/Ab42_sec_IN_HOURS",  # 10 parameter curves
-        "Abeta/Meisl2014/Ab40_sec_IN_HOURS",  # 11 parameter curves
-        "htt/Kakkar2016/FIts/Kakkar2016_6kDa_polyQ_prim",  # 4 parameter curves
-        "htt/Kar2011/Fits/Kar2011_Q30_without_lowest_conc_sec",  # 5 parameter curves
-        "biofilm proteins/CsgA/CsgA_prim_IN_HOURS",  # 6 parameter curves
-        "biofilm proteins/RdlB_Yang2017/Fits/5and20uM_prim",  # 2 parameter curves
-        # Single-curve cross-protein holdouts
-        "IAPP/Daval2010/Fits/Daval2010_prim",
-        "IAPP/Daval2010/Fits/Daval2010_sec",
-        "hnRNPA/Kim2013/Fits/Kim2013_A1_prim",
-        "insulin/Fits/Nielsen2001_seeded_sec",
-        "lysozyme/Fits/Hasecke2018_7uM_sec",
+        "Abeta/Meisl2014/Ab40_sec_IN_HOURS",  # 11 curves
+        "Abeta/Cohen2013/Ab42_sec_IN_HOURS",  # 10 curves
+        "biofilm proteins/CsgA/CsgA_IN_HOURS",  # 6 curves
+        "htt/Kar2011/Kar2011_Q30_without_lowest_conc_sec",  # 5 curves
+        "gelsolin/Fig4A",  # 4 curves
+        "IAPP/Daval2010",
+        "IAPP/Pilkington2017",
+        "SH3/Zurdo2001_pH2_sec",
+        "haemoglobin/Ferrone1985a",
+        "hnRNPA/Kim2013/Kim2013_A1_sec",
+        "lysozyme/Hasecke2018_7uM_sec",
+        "serum amyloid/Srinivasan2013_Saa1.1_sec",
     }
 )
 GAUSSIAN_SMOOTH_SIGMA = float(os.environ.get("SKYDISCOVER_GAUSSIAN_SMOOTH_SIGMA", "1.0"))
@@ -71,6 +73,7 @@ ODE_MULTISTART_SCALES = tuple(
     if value.strip()
 )
 SINGLE_EQUATION_ERROR_PREFIX = "Single-equation violation"
+_ARRAY_CURVE_IDS: dict[int, np.ndarray] = {}
 _ALLOWED_IMPORTS = {"sympy", "numpy"}
 _ALLOWED_FROM_IMPORTS = {
     "__future__",
@@ -418,40 +421,28 @@ def validate_candidate_source(program_path: str) -> None:
         )
 
 
-def _parse_parameter_from_column(column_name: str) -> float | None:
-    """Extract a monomer/protein concentration from a fit.tsv column header.
+def _parse_metadata_number(header: str, key: str) -> float | None:
+    """Extract the leading numeric value for a cleaned header field."""
+    match = re.search(
+        rf"(?:^|[\s_]){re.escape(key)}:\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)",
+        header,
+    )
+    if match is None:
+        return None
+    return float(match.group(1))
 
-    Only concentration-like labels are accepted:
-      - "... : 10uM"  or "10 uM"  → 10.0
-      - "35uM" (bare, as in Abeta) → 35.0
-      - "... : 3.95mM"             → 3950.0  (converted to uM)
-      - "... : 0.3 mg/mL 22uM"    → 22.0    (prefer uM when both present)
 
-    Seed percentages, pH values, ng/uL seed-material labels, and generic
-    numeric fallbacks are intentionally ignored so x1 consistently represents
-    the aggregating monomer/protein concentration when available.
-    """
-    text = column_name.strip()
-    # Prefer the human-readable condition after the file-name prefix. Some
-    # filenames contain seed concentrations that should not become x1.
-    condition_text = text.rsplit(":", 1)[-1].strip().strip("\"'")
+def _is_x_column(header: str) -> bool:
+    return bool(re.search(r"\s*X\s*$", header.strip()))
 
-    # Prefer an explicit uM value
-    m = re.search(r"(\d+(?:\.\d+)?)\s*uM", condition_text, re.IGNORECASE)
-    if m:
-        return float(m.group(1))
 
-    # mM → convert to uM
-    m = re.search(r"(\d+(?:\.\d+)?)\s*mM", condition_text, re.IGNORECASE)
-    if m:
-        return float(m.group(1)) * 1000.0
+def _is_y_column(header: str) -> bool:
+    return bool(re.search(r"\s*Y\s*$", header.strip()))
 
-    # mg/mL (take the number)
-    m = re.search(r"(\d+(?:\.\d+)?)\s*mg/mL", condition_text, re.IGNORECASE)
-    if m:
-        return float(m.group(1))
 
-    return None
+def _remember_curve_ids(X: np.ndarray, curve_ids: np.ndarray) -> np.ndarray:
+    _ARRAY_CURVE_IDS[id(X)] = np.asarray(curve_ids, dtype=int)
+    return X
 
 
 def _minmax_normalize(values: np.ndarray) -> np.ndarray:
@@ -466,35 +457,47 @@ def _minmax_normalize(values: np.ndarray) -> np.ndarray:
 
 
 def _load_fit_table(data_file: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load a wide fit.tsv and return X=[normalized time, raw parameter, c], y.
+    """Load cleaned data.tsv and return X=[normalized time, m0, M0, c], y.
 
-    The first column is always the time/measurement coordinate. Remaining
-    columns are response curves. The varying parameter is extracted from
-    concentration-like curve headers only; non-concentration columns are skipped.
-    Time is min-max normalized to 0..1, but the parameter column is left in its
-    parsed raw units. The response is normalized globally across the whole
-    fit.tsv to 0..1. Files already rescaled to 0..1 keep that scale.
+    Cleaned files store one trajectory per adjacent X/Y column pair. Each
+    column header contains m0, M0, and L0 metadata; only m0 and M0 are exposed
+    as static ODE features. Units are intentionally ignored per the cleaned-data
+    note: the leading numeric value is used as provided.
     """
     with data_file.open(newline="") as f:
         reader = csv.reader(f, delimiter="\t")
         header = next(reader)
+        rows = [row for row in reader if row]
 
-        response_headers = header[1:]
-        parsed_params = [_parse_parameter_from_column(h) for h in response_headers]
-
-        features: list[list[float]] = []
-        targets: list[float] = []
-        for row in reader:
-            if not row:
+    features: list[list[float]] = []
+    targets: list[float] = []
+    curve_ids: list[int] = []
+    curve_id = 0
+    for col_idx in range(len(header) - 1):
+        x_header = header[col_idx]
+        y_header = header[col_idx + 1]
+        if not (_is_x_column(x_header) and _is_y_column(y_header)):
+            continue
+        m0 = _parse_metadata_number(x_header, "m0")
+        seed_m0 = _parse_metadata_number(x_header, "M0")
+        if m0 is None or seed_m0 is None:
+            continue
+        for row in rows:
+            if col_idx + 1 >= len(row):
                 continue
-            measurement_x = float(row[0])
-            for param, value in zip(parsed_params, row[1:]):
-                if param is None:
-                    continue
-                if value == "" or value.strip().lower() == "nan":
-                    continue
-                features.append([measurement_x, param])
-                targets.append(float(value))
+            time_value = row[col_idx].strip()
+            response_value = row[col_idx + 1].strip()
+            if (
+                not time_value
+                or not response_value
+                or time_value.lower() == "nan"
+                or response_value.lower() == "nan"
+            ):
+                continue
+            features.append([float(time_value), m0, seed_m0])
+            targets.append(float(response_value))
+            curve_ids.append(curve_id)
+        curve_id += 1
 
     if not features:
         raise ValueError(f"No regression samples loaded from {data_file}")
@@ -502,21 +505,22 @@ def _load_fit_table(data_file: Path) -> tuple[np.ndarray, np.ndarray]:
     X = np.asarray(features, dtype=float)
     y = np.asarray(targets, dtype=float)
     time_norm = _minmax_normalize(X[:, 0])
-    parameter_raw = X[:, 1]
+    monomer_raw = X[:, 1]
+    seed_raw = X[:, 2]
     y_norm = _minmax_normalize(y)
 
-    # x2 is the concentration state c used by ODE RHS templates. During scoring
+    # x3 is the concentration state c used by ODE RHS templates. During scoring
     # it is supplied from odeint's dynamic state, not read from candidate code.
-    X_ode = np.column_stack([time_norm, parameter_raw, y_norm])
-    return X_ode, y_norm
+    X_ode = np.column_stack([time_norm, monomer_raw, seed_raw, y_norm])
+    return _remember_curve_ids(X_ode, np.asarray(curve_ids, dtype=int)), y_norm
 
 
 def discover_datasets(root: Path = DATA_ROOT) -> list[tuple[str, Path]]:
-    """Recursively find all fit.tsv files and return (dataset_name, path) pairs."""
+    """Recursively find all cleaned data.tsv files and return dataset entries."""
     datasets: list[tuple[str, Path]] = []
     for dirpath, _dirnames, filenames in os.walk(root):
-        if "fit.tsv" in filenames:
-            fit_path = Path(dirpath) / "fit.tsv"
+        if "data.tsv" in filenames:
+            fit_path = Path(dirpath) / "data.tsv"
             rel = fit_path.parent.relative_to(root)
             name = str(rel).replace(os.sep, "/")
             datasets.append((name, fit_path))
@@ -524,37 +528,51 @@ def discover_datasets(root: Path = DATA_ROOT) -> list[tuple[str, Path]]:
     return datasets
 
 
+def _curve_indices(X: np.ndarray) -> list[np.ndarray]:
+    """Return cleaned-trajectory row indices."""
+    if X.shape[0] == 0:
+        return []
+    curve_ids = _ARRAY_CURVE_IDS.get(id(X))
+    if curve_ids is not None and curve_ids.shape[0] == X.shape[0]:
+        return [np.flatnonzero(curve_ids == curve_id) for curve_id in dict.fromkeys(curve_ids)]
+    return [np.arange(X.shape[0], dtype=int)]
+
+
 def _trajectory_preserving_split(
     X: np.ndarray,
     y: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Split whole parameter curves into fit (train) and NMSE-evaluation (val) sets."""
-    parameters = np.unique(X[:, 1])
+    """Split whole cleaned X/Y curves into fit and NMSE-evaluation sets."""
+    curves = _curve_indices(X)
     rng = np.random.default_rng(RANDOM_STATE)
 
-    if len(parameters) < 3:
+    if len(curves) < 3:
         empty_X = np.empty((0, X.shape[1]), dtype=float)
         empty_y = np.empty(0, dtype=float)
         return X, empty_X, y, empty_y
 
-    shuffled = parameters[rng.permutation(len(parameters))]
+    shuffled = rng.permutation(len(curves))
     n_val_curves = min(
-        max(1, int(round(len(parameters) * TEST_SIZE))), len(parameters) - 1
+        max(1, int(round(len(curves) * TEST_SIZE))), len(curves) - 1
     )
-    val_params = {float(p) for p in shuffled[:n_val_curves]}
+    val_curve_ids = set(int(i) for i in shuffled[:n_val_curves])
 
     fit_indices: list[int] = []
     val_indices: list[int] = []
-    for parameter in parameters:
-        curve_idx = np.flatnonzero(X[:, 1] == parameter)
-        if float(parameter) in val_params:
+    for curve_id, curve_idx in enumerate(curves):
+        if curve_id in val_curve_ids:
             val_indices.extend(curve_idx.tolist())
         else:
             fit_indices.extend(curve_idx.tolist())
 
     fit_idx = np.sort(np.asarray(fit_indices, dtype=int))
     val_idx = np.sort(np.asarray(val_indices, dtype=int))
-    return X[fit_idx], X[val_idx], y[fit_idx], y[val_idx]
+    curve_ids = _ARRAY_CURVE_IDS.get(id(X), np.zeros(X.shape[0], dtype=int))
+    X_fit = X[fit_idx]
+    X_val = X[val_idx]
+    _remember_curve_ids(X_fit, curve_ids[fit_idx])
+    _remember_curve_ids(X_val, curve_ids[val_idx])
+    return X_fit, X_val, y[fit_idx], y[val_idx]
 
 
 def _evaluation_only_split(
@@ -564,6 +582,8 @@ def _evaluation_only_split(
     """Hold out an entire dataset for validation-only cross-protein evaluation."""
     empty_X = np.empty((0, X.shape[1]), dtype=float)
     empty_y = np.empty(0, dtype=float)
+    _remember_curve_ids(empty_X, np.empty(0, dtype=int))
+    _remember_curve_ids(X, _ARRAY_CURVE_IDS.get(id(X), np.zeros(X.shape[0], dtype=int)))
     return empty_X, X, empty_y, y
 
 
@@ -576,7 +596,7 @@ def load_dataset(
     *,
     dataset_name: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load a single fit.tsv and return deterministic trajectory-preserving split."""
+    """Load a single data.tsv and return deterministic trajectory-preserving split."""
     X, y = _load_fit_table(data_file)
     name = dataset_name or _dataset_name_from_path(data_file)
     if name in EVALUATION_ONLY_DATASETS:
@@ -677,7 +697,7 @@ def _ode_predictions(
     y_known: np.ndarray,
     theta: np.ndarray,
 ) -> np.ndarray:
-    """Integrate dc/dt=f(t, parameter, c) per parameter curve on one split."""
+    """Integrate dc/dt=f(t, m0, M0, c) per cleaned X/Y curve."""
     import warnings
 
     from scipy.integrate import odeint
@@ -687,11 +707,11 @@ def _ode_predictions(
     theta = np.asarray(theta, dtype=float).reshape(-1)
     predictions = np.full_like(y_known, np.nan, dtype=float)
 
-    for parameter in np.unique(X[:, 1]):
-        curve_idx = np.flatnonzero(X[:, 1] == parameter)
+    for curve_idx in _curve_indices(X):
         ordered_idx = curve_idx[np.argsort(X[curve_idx, 0])]
         times = X[ordered_idx, 0]
         observed = y_known[ordered_idx]
+        static_features = [float(value) for value in X[ordered_idx[0], 1:-1]]
 
         if len(ordered_idx) == 1 or float(times[-1] - times[0]) <= 0.0:
             predictions[ordered_idx] = observed[0]
@@ -699,7 +719,7 @@ def _ode_predictions(
 
         def dc_dt(c_state: np.ndarray, time_value: float) -> float:
             c_value = float(np.asarray(c_state, dtype=float).reshape(-1)[0])
-            value = rhs_fn(float(time_value), float(parameter), c_value, *theta)
+            value = rhs_fn(float(time_value), *static_features, c_value, *theta)
             value = float(np.asarray(value, dtype=float).reshape(-1)[0])
             if not np.isfinite(value):
                 raise FloatingPointError("non-finite ODE derivative")

@@ -30,22 +30,25 @@ def evaluate_symbolic_candidate(
     universal kinetic mechanism while the constants adapt to each protein
     system's specific rates, concentrations, and timescales.
 
-    Features: x0 = normalized elapsed time, x1 = normalized varying
-    experimental parameter (concentration, pH, etc.), x2 = concentration c.
+    Features: x0 = normalized elapsed time, x1 = m0 initial monomer
+    concentration, x2 = M0 seed concentration, x3 = concentration c.
+    Units are ignored by the cleaned-data loader; leading numeric values are
+    used directly.
 
     Logistic-growth ODE template with parameter-dependent rate:
 
-        d(c)/dt = c0 * (1 + c1*x1) * c * (c2 - c)
+        d(c)/dt = c0 * (1 + c1*x1 + c2*x2) * c * (c3 - c)
     """
     x = feature_symbols(X_train.shape[1])
-    c = constant_symbols(3)
+    c = constant_symbols(4)
 
     time = x[0]
-    parameter = x[1]
-    concentration = x[2]
+    monomer = x[1]
+    seed = x[2]
+    concentration = x[3]
 
-    rate = c[0] * (1 + c[1] * parameter)
-    plateau = c[2]
+    rate = c[0] * (1 + c[1] * monomer + c[2] * seed)
+    plateau = c[3]
 
     expression = rate * concentration * (plateau - concentration)
 
@@ -56,7 +59,7 @@ def evaluate_symbolic_candidate(
         X_val,
         y_val,
         constants=c,
-        initial_values=[1.0, 0.0, 1.0],
+        initial_values=[1.0, 0.0, 0.0, 1.0],
     )
 
 

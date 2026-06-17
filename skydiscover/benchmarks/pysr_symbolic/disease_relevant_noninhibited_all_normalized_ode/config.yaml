@@ -11,10 +11,10 @@ random_seed: 42
 
 llm:
   models:
-    - name: "us.anthropic.claude-sonnet-4-6"
+    - name: "us.anthropic.claude-opus-4-8"
       weight: 1.0
   api_base: "bedrock:us-east-1"
-  temperature: 0.7
+  temperature:
   max_tokens: 60000
   timeout: 1800
   retries: 2
@@ -26,33 +26,38 @@ prompt:
 
     ## Multi-Dataset Task
     You are searching for one symbolic ODE right-hand-side template for
-    disease-relevant, non-inhibited protein aggregation datasets. All datasets
-    live under:
-      /home/mrsar/protein-ag/past-published-data/disease-relevant non-inhibited/
+    disease-relevant, non-inhibited protein aggregation datasets. Cleaned
+    datasets live under:
+      /home/mrsar/protein-ag/disease-relevant non-inhibited_clean/
 
-    Each dataset is a `fit.tsv` file (wide table). The evaluator normalizes
-    every dataset before fitting:
+    Each dataset is a `data.tsv` file. Every adjacent X/Y column pair is one
+    experimental curve, and each paired header is named with:
+      m0:<initial monomer>_M0:<seed concentration>_L0:<seed length>
+
+    The evaluator normalizes every dataset before fitting:
     - x0 = min-max normalized measurement time coordinate
-    - x1 = varying experimental parameter extracted from column headers;
-      sequential index if non-numeric, then min-max normalized
-    - x2 = current normalized concentration/state c supplied by ODE integration
+    - x1 = m0 initial monomer concentration, parsed as the leading number
+      from the header while ignoring units
+    - x2 = M0 seed concentration, parsed as the leading number from the
+      header while ignoring units
+    - x3 = current normalized concentration/state c supplied by ODE integration
     - y  = response/concentration min-max normalized globally across the
-      whole fit.tsv response table
+      whole data.tsv response table
 
     Many source files are already response-rescaled to 0→1. The evaluator uses
     the same global per-dataset min-max normalization, so those files remain on
     the same scale while unnormalized files are brought to the same range.
 
     Splits separate constant fitting from NMSE evaluation:
-    - datasets with 3 or more parameter curves hold out whole x1 curves for
+    - datasets with 3 or more curves hold out whole X/Y curves for
       validation; remaining curves stay entirely in the train split;
-    - datasets with fewer than 3 parameter curves use all points for constant
+    - datasets with fewer than 3 curves use all points for constant
       fitting only and do not contribute validation NMSE to the aggregate score;
-    - eleven designated cross-protein evaluation datasets keep all points in
-      validation only (empty train split): five with 1 curve, one with 2 curves,
-      one with 4 curves, one with 5 curves, one with 6 curves, one with 10
-      curves, and one with 11 curves. Constants for these datasets are fitted
-      on their validation points at scoring time.
+    - twelve designated cross-protein evaluation datasets keep all points in
+      validation only (empty train split): seven with 1 curve, one with 4
+      curves, one with 5 curves, one with 6 curves, one with 10 curves, and
+      one with 11 curves. Constants for these datasets are fitted on their
+      validation points at scoring time.
 
     **Key constraint:** The ODE structure must be identical across all
     datasets, but a separate set of constants is fitted independently for each
@@ -193,8 +198,8 @@ prompt:
 
     Use `pysr_harness.equation_session` helpers:
     - `feature_symbols(n)` → PySR variables `x0`, `x1`, ...
-      Here x0 is time t, x1 is the experimental parameter, and x2 is the
-      current concentration/state c.
+      Here x0 is time t, x1 is m0, x2 is M0, and x3 is the current
+      concentration/state c.
     - `constant_symbols(n)` → tunable constants `c0`, `c1`, ...
     - `evaluate_expression(expr, X_train, y_train, X_val, y_val, constants=...)`
       fits constants via least-squares, integrates `dc/dt = expr` with
@@ -227,7 +232,7 @@ prompt:
     Before changing the expression, identify the most likely limitation:
     - poor fit quality on many datasets
     - non-finite predictions or invalid arithmetic on one or more datasets
-    - excessive sensitivity to x0 or x1 scaling
+    - excessive sensitivity to x0, x1, or x2 scaling
     - over-parameterization that makes constant fitting unreliable
     - under-parameterization that cannot capture shared structure
     - a redundant term that adds complexity without improving robustness
@@ -242,7 +247,7 @@ prompt:
     - smooth and globally defined over the observed x0 and x1 ranges
     - numerically stable during least-squares fitting
     - compact enough for reliable optimization from one initial point
-    - able to use x1 when it is informative without depending on it too strongly
+    - able to use m0 and M0 when informative without depending on them too strongly
     - robust on small, noisy, or unusually scaled datasets
 
     Be especially cautious with operations that can create singularities,
