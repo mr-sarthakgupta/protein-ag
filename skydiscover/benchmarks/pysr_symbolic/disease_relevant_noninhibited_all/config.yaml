@@ -81,23 +81,45 @@ prompt:
     `return evaluate_expression(...)`.
 
     ## Objective
-    Improve mean validation NMSE across all datasets while keeping the symbolic
-    expression compact. Higher `combined_score` means lower mean validation
-    NMSE. Validation errors are normalized by the full train+validation response
-    variance for that dataset.
+    Improve a composite validation loss while keeping the symbolic expression
+    compact. Raw NMSE is still reported, but the score is no longer NMSE-only.
+    The evaluator now combines pointwise fit quality with a bounded shape term:
 
-    Each validation point counts equally in the aggregate reward. Datasets with
-    more held-out validation curves therefore contribute proportionally more:
+        per_dataset_scored_loss =
+            (1 - shape_loss_weight) * dataset_nmse
+            + shape_loss_weight * dataset_shape_loss
 
-        per_dataset_loss = dataset_nmse
-        scored_nmse = sum(per_dataset_loss * n_val_points) / sum(n_val_points)
+    where `shape_loss_weight` defaults to 0.25 and is capped below 0.30. The
+    shape loss compares each validation trajectory's slope profile and
+    half-response/onset timing. This is meant to penalize curves that get a
+    tolerable pointwise NMSE while visibly missing aggregation kinetics.
 
-    Hard-case datasets are still reported in evaluator feedback so you can
-    target outliers. Higher `combined_score` then applies a bounded 20% parsimony penalty for
-    more complex expressions:
+    Raw validation errors are normalized by the full train+validation response
+    variance for that dataset. Each validation point still counts equally in the
+    aggregate reward:
 
-        fit_score = 1 / (1 + scored_nmse)
+        scored_loss = sum(per_dataset_scored_loss * n_val_points) / sum(n_val_points)
+
+    Higher `combined_score` means lower `scored_loss`, after a bounded 20%
+    parsimony penalty for more complex expressions:
+
+        fit_score = 1 / (1 + scored_loss)
         combined_score = fit_score * parsimony_penalty_factor
+
+    Pay attention to the separate validation semantics reported by the
+    evaluator:
+    - `heldout_curve_scored_loss`, `heldout_curve_nmse`, and
+      `heldout_curve_shape_loss` measure extrapolation to held-out whole
+      curves after fitting constants on training curves. These are the primary
+      generalization diagnostics.
+    - `eval_only_scored_loss`, `eval_only_nmse`, and `eval_only_shape_loss`
+      measure datasets where constants are fit on the same validation points
+      being scored. These are fit-quality/cross-protein diagnostics, not pure
+      held-out generalization.
+
+    Hard-case datasets are reported with `scored`, `nmse`, and `shape`
+    components so you can tell whether to improve pointwise fit, kinetic shape,
+    or robustness on held-out curves.
 
     A candidate that fails on any dataset is penalized heavily, so robustness
     across all datasets matters more than a strong fit on a subset. Simplicity
@@ -170,7 +192,7 @@ prompt:
     - `reference/current_adaevolve_run/run_history_summary.json`
     - `reference/current_adaevolve_run/adaevolve_iteration_stats.jsonl`
     - `reference/current_adaevolve_run/checkpoints/`
-    - `reference/agentic_trace_*.json`
+    - earlier agent transcripts/traces: `reference/agentic_trace_*.json`
 
     Treat this snapshot as context, not as a target to copy. Prefer the summary
     first; only read individual checkpoint programs when you need to understand

@@ -622,6 +622,8 @@ PARSIMONY_WEIGHT = float(os.environ.get("SKYDISCOVER_PARSIMONY_WEIGHT", "0.20"))
 PARSIMONY_COMPLEXITY_SCALE = float(
     os.environ.get("SKYDISCOVER_PARSIMONY_COMPLEXITY_SCALE", "160")
 )
+SHAPE_LOSS_WEIGHT = float(os.environ.get("SKYDISCOVER_SHAPE_LOSS_WEIGHT", "0.25"))
+SHAPE_LOSS_WEIGHT = min(max(SHAPE_LOSS_WEIGHT, 0.0), 0.29)
 
 
 def _parsimony_penalty_factor(complexity: float) -> float:
@@ -689,6 +691,92 @@ def _nmse_with_gaussian_smoothed_target(
     return _normalized_mse_with_reference_variance(y_true, y_pred, reference)
 
 
+def _bounded_loss(value: float) -> float:
+    """Map a nonnegative loss to [0, 1), preserving order."""
+    if not np.isfinite(value):
+        return 1.0
+    value = max(float(value), 0.0)
+    return float(value / (1.0 + value))
+
+
+def _half_response_time(x: np.ndarray, y: np.ndarray, level: float = 0.5) -> float | None:
+    """Return interpolated normalized time where a curve crosses a response level."""
+    x = np.asarray(x, dtype=float).reshape(-1)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    if x.size < 2 or y.size != x.size:
+        return None
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+    for i in range(y.size - 1):
+        y0 = float(y[i])
+        y1 = float(y[i + 1])
+        if y0 == level:
+            return float(x[i])
+        if (y0 - level) * (y1 - level) <= 0.0 and y0 != y1:
+            fraction = (level - y0) / (y1 - y0)
+            return float(x[i] + fraction * (x[i + 1] - x[i]))
+    if y[-1] == level:
+        return float(x[-1])
+    return None
+
+
+def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Bounded shape mismatch based on curve slopes and half-response timing."""
+    X = np.asarray(X, dtype=float)
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+    if X.shape[0] != y_true.size or y_true.shape != y_pred.shape or y_true.size < 3:
+        return 0.0
+    if not np.all(np.isfinite(y_pred)):
+        return 1.0
+
+    curve_ids = _ARRAY_CURVE_IDS.get(id(X))
+    if curve_ids is None or curve_ids.shape[0] != X.shape[0]:
+        curve_ids = np.zeros(X.shape[0], dtype=int)
+
+    curve_losses: list[float] = []
+    for curve_id in dict.fromkeys(np.asarray(curve_ids, dtype=int)):
+        idx = np.flatnonzero(curve_ids == curve_id)
+        if idx.size < 3:
+            continue
+        order = idx[np.argsort(X[idx, 0])]
+        x = X[order, 0]
+        true_curve = y_true[order]
+        pred_curve = y_pred[order]
+        dx = np.diff(x)
+        valid_dx = np.abs(dx) > 1e-12
+        if not np.any(valid_dx):
+            continue
+        true_slope = np.diff(true_curve)[valid_dx] / dx[valid_dx]
+        pred_slope = np.diff(pred_curve)[valid_dx] / dx[valid_dx]
+        slope_scale = float(np.mean(true_slope**2))
+        slope_raw = float(np.mean((pred_slope - true_slope) ** 2))
+        slope_loss = _bounded_loss(slope_raw / slope_scale) if slope_scale > 0.0 else _bounded_loss(slope_raw)
+
+        true_half = _half_response_time(x, true_curve)
+        pred_half = _half_response_time(x, pred_curve)
+        if true_half is None and pred_half is None:
+            timing_loss = 0.0
+        elif true_half is None or pred_half is None:
+            timing_loss = 1.0
+        else:
+            timing_loss = min(abs(float(pred_half) - float(true_half)), 1.0)
+
+        curve_losses.append(0.7 * slope_loss + 0.3 * timing_loss)
+
+    if not curve_losses:
+        return 0.0
+    return float(np.mean(curve_losses))
+
+
+def _composite_scored_loss(nmse_val: float, shape_loss: float) -> float:
+    if not np.isfinite(nmse_val):
+        return float("inf")
+    bounded_shape = min(max(float(shape_loss), 0.0), 1.0) if np.isfinite(shape_loss) else 1.0
+    return float((1.0 - SHAPE_LOSS_WEIGHT) * float(nmse_val) + SHAPE_LOSS_WEIGHT * bounded_shape)
+
+
 def evaluate_symbolic_expression(
     expression: Any,
     X_train: np.ndarray,
@@ -741,6 +829,9 @@ def evaluate_symbolic_expression(
         feature_syms = equation_session.feature_symbols(n_features)
         X_cols = [X_fit[:, i] for i in range(n_features)]
         compiled = sp.lambdify(feature_syms + constants, template, modules=["numpy"])
+        fit_reference = y_train if y_train.size else y_fit
+        fit_reference_var = float(np.var(fit_reference)) if fit_reference.size else 0.0
+        fit_residual_scale = float(np.sqrt(fit_reference_var)) if fit_reference_var > 0.0 else 1.0
 
         def residual(theta: np.ndarray) -> np.ndarray:
             try:
@@ -750,7 +841,7 @@ def evaluate_symbolic_expression(
                 return np.full_like(y_fit, 1e12, dtype=float)
             if prediction.shape != y_fit.shape or not np.all(np.isfinite(prediction)):
                 return np.full_like(y_fit, 1e12, dtype=float)
-            return prediction - y_fit
+            return (prediction - y_fit) / fit_residual_scale
 
         import warnings
 
@@ -808,6 +899,12 @@ def evaluate_symbolic_expression(
         if train_only
         else _nmse_with_gaussian_smoothed_target(y_val, y_pred_val, X_val, y_reference)
     )
+    shape_loss_val = (
+        float("nan") if train_only else _curve_shape_loss(X_val, y_val, y_pred_val)
+    )
+    scored_loss_val = (
+        float("nan") if train_only else _composite_scored_loss(nmse_val, shape_loss_val)
+    )
     loss = float(np.mean((y_pred_fit - y_fit) ** 2))
 
     result = {
@@ -818,13 +915,16 @@ def evaluate_symbolic_expression(
         "complexity": equation_session._complexity(template),
         "nmse_train": nmse_train,
         "nmse_val": nmse_val,
+        "shape_loss_val": shape_loss_val,
+        "scored_loss_val": scored_loss_val,
+        "shape_loss_weight": SHAPE_LOSS_WEIGHT,
         "n_val_points": int(len(y_val)),
         "evaluation_only": evaluation_only,
         "train_only": train_only,
         "combined_score": (
             0.0
-            if train_only or not np.isfinite(nmse_val)
-            else combined_score_from_nmse(nmse_val)
+            if train_only or not np.isfinite(scored_loss_val)
+            else combined_score_from_nmse(scored_loss_val)
         ),
     }
     equation_session._record_scorer_result(result)
@@ -858,6 +958,12 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
     }
     raw_nmse_vals = [float(r["nmse_val"]) for r in scoring_results.values()]
     nmse_vals = list(raw_nmse_vals)
+    scored_loss_vals = [
+        float(r.get("scored_loss_val", r["nmse_val"])) for r in scoring_results.values()
+    ]
+    shape_loss_vals = [
+        float(r.get("shape_loss_val", 0.0)) for r in scoring_results.values()
+    ]
     train_nmse_vals = [
         float(r["nmse_train"])
         for r in per_dataset_results.values()
@@ -900,14 +1006,22 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
             break
 
     hard_cases = [
-        {"dataset": name, "nmse_val": float(result["nmse_val"])}
+        {
+            "dataset": name,
+            "scored_loss_val": float(result.get("scored_loss_val", result["nmse_val"])),
+            "nmse_val": float(result["nmse_val"]),
+            "shape_loss_val": float(result.get("shape_loss_val", 0.0)),
+            "evaluation_only": bool(result.get("evaluation_only")),
+        }
         for name, result in scoring_results.items()
-        if np.isfinite(float(result.get("nmse_val", float("inf"))))
+        if np.isfinite(float(result.get("scored_loss_val", result.get("nmse_val", float("inf")))))
     ]
-    hard_cases.sort(key=lambda item: item["nmse_val"], reverse=True)
+    hard_cases.sort(key=lambda item: item["scored_loss_val"], reverse=True)
     hard_cases = hard_cases[:5]
     hard_case_feedback = "; ".join(
-        f"{case['dataset']} nmse={case['nmse_val']:.4g}" for case in hard_cases
+        f"{case['dataset']} scored={case['scored_loss_val']:.4g} "
+        f"(nmse={case['nmse_val']:.4g}, shape={case['shape_loss_val']:.4g})"
+        for case in hard_cases
     )
 
     violation_error = None
@@ -932,29 +1046,75 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
 
     if violation_error:
         agg_nmse = float("inf")
+        agg_scored_loss = float("inf")
+        agg_shape_loss = float("inf")
         mean_nmse = float("inf")
+        mean_scored_loss = float("inf")
         agg_train_nmse = float("inf")
         agg_combined = 0.0
         n_successful = 0
+        heldout_curve_nmse = float("inf")
+        heldout_curve_scored_loss = float("inf")
+        heldout_curve_shape_loss = float("inf")
+        mean_nmse_eval_only = float("inf")
+        mean_scored_loss_eval_only = float("inf")
+        mean_shape_loss_eval_only = float("inf")
     else:
         val_point_weights = [
             int(r.get("n_val_points", 0)) for r in scoring_results.values()
         ]
         mean_nmse = _point_weighted_mean(nmse_vals, val_point_weights)
         raw_mean_nmse = _point_weighted_mean(raw_nmse_vals, val_point_weights)
+        mean_scored_loss = _point_weighted_mean(scored_loss_vals, val_point_weights)
+        agg_shape_loss = _point_weighted_mean(shape_loss_vals, val_point_weights)
         eval_only_results = {
             name: result
             for name, result in scoring_results.items()
             if result.get("evaluation_only")
+        }
+        heldout_curve_results = {
+            name: result
+            for name, result in scoring_results.items()
+            if not result.get("evaluation_only")
         }
         eval_only_nmse_vals = [
             float(result["nmse_val"])
             for result in eval_only_results.values()
             if np.isfinite(float(result.get("nmse_val", float("inf"))))
         ]
+        eval_only_scored_loss_vals = [
+            float(result.get("scored_loss_val", result["nmse_val"]))
+            for result in eval_only_results.values()
+            if np.isfinite(float(result.get("scored_loss_val", result.get("nmse_val", float("inf")))))
+        ]
+        eval_only_shape_loss_vals = [
+            float(result.get("shape_loss_val", 0.0))
+            for result in eval_only_results.values()
+            if np.isfinite(float(result.get("shape_loss_val", 0.0)))
+        ]
         eval_only_weights = [
             int(result.get("n_val_points", 0))
             for result in eval_only_results.values()
+            if np.isfinite(float(result.get("nmse_val", float("inf"))))
+        ]
+        heldout_nmse_vals = [
+            float(result["nmse_val"])
+            for result in heldout_curve_results.values()
+            if np.isfinite(float(result.get("nmse_val", float("inf"))))
+        ]
+        heldout_scored_loss_vals = [
+            float(result.get("scored_loss_val", result["nmse_val"]))
+            for result in heldout_curve_results.values()
+            if np.isfinite(float(result.get("scored_loss_val", result.get("nmse_val", float("inf")))))
+        ]
+        heldout_shape_loss_vals = [
+            float(result.get("shape_loss_val", 0.0))
+            for result in heldout_curve_results.values()
+            if np.isfinite(float(result.get("shape_loss_val", 0.0)))
+        ]
+        heldout_weights = [
+            int(result.get("n_val_points", 0))
+            for result in heldout_curve_results.values()
             if np.isfinite(float(result.get("nmse_val", float("inf"))))
         ]
         mean_nmse_eval_only = (
@@ -962,14 +1122,51 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
             if eval_only_nmse_vals
             else float("nan")
         )
+        mean_scored_loss_eval_only = (
+            _point_weighted_mean(eval_only_scored_loss_vals, eval_only_weights)
+            if eval_only_scored_loss_vals
+            else float("nan")
+        )
+        mean_shape_loss_eval_only = (
+            _point_weighted_mean(eval_only_shape_loss_vals, eval_only_weights)
+            if eval_only_shape_loss_vals
+            else float("nan")
+        )
+        heldout_curve_nmse = (
+            _point_weighted_mean(heldout_nmse_vals, heldout_weights)
+            if heldout_nmse_vals
+            else float("nan")
+        )
+        heldout_curve_scored_loss = (
+            _point_weighted_mean(heldout_scored_loss_vals, heldout_weights)
+            if heldout_scored_loss_vals
+            else float("nan")
+        )
+        heldout_curve_shape_loss = (
+            _point_weighted_mean(heldout_shape_loss_vals, heldout_weights)
+            if heldout_shape_loss_vals
+            else float("nan")
+        )
         agg_nmse = mean_nmse
+        agg_scored_loss = mean_scored_loss
         agg_train_nmse = float(np.mean(train_nmse_vals)) if train_nmse_vals else float("inf")
         raw_combined = (
-            float(1.0 / (1.0 + max(agg_nmse, 0.0))) if np.isfinite(agg_nmse) else 0.0
+            float(1.0 / (1.0 + max(agg_scored_loss, 0.0)))
+            if np.isfinite(agg_scored_loss)
+            else 0.0
         )
         parsimony_factor = _parsimony_penalty_factor(aggregate_complexity)
         agg_combined = raw_combined * parsimony_factor
         n_successful = sum(1 for value in nmse_vals if np.isfinite(value))
+
+    validation_semantics_feedback = (
+        "heldout_curve_scored_loss="
+        f"{heldout_curve_scored_loss:.4g}, heldout_curve_nmse={heldout_curve_nmse:.4g}, "
+        f"heldout_curve_shape={heldout_curve_shape_loss:.4g}; "
+        "eval_only_fit_score_scored_loss="
+        f"{mean_scored_loss_eval_only:.4g}, eval_only_nmse={mean_nmse_eval_only:.4g}, "
+        f"eval_only_shape={mean_shape_loss_eval_only:.4g}"
+    )
 
     aggregated = {
         "equation": eq_template,
@@ -977,6 +1174,20 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         "nmse_val": agg_nmse,
         "mean_nmse_val": mean_nmse,
         "mean_raw_nmse_val": raw_mean_nmse if not violation_error else float("inf"),
+        "scored_loss_val": agg_scored_loss,
+        "mean_scored_loss_val": mean_scored_loss,
+        "shape_loss_val": agg_shape_loss,
+        "shape_loss_weight": SHAPE_LOSS_WEIGHT,
+        "heldout_curve_nmse": heldout_curve_nmse,
+        "heldout_curve_scored_loss": heldout_curve_scored_loss,
+        "heldout_curve_shape_loss": heldout_curve_shape_loss,
+        "eval_only_nmse": mean_nmse_eval_only if not violation_error else float("inf"),
+        "eval_only_scored_loss": (
+            mean_scored_loss_eval_only if not violation_error else float("inf")
+        ),
+        "eval_only_shape_loss": (
+            mean_shape_loss_eval_only if not violation_error else float("inf")
+        ),
         "combined_score": agg_combined,
         "fit_score": raw_combined if not violation_error else 0.0,
         "complexity": aggregate_complexity,
@@ -997,6 +1208,7 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         "eval_workers": NUM_WORKERS,
         "hard_cases": hard_cases,
         "hard_case_feedback": hard_case_feedback,
+        "validation_semantics_feedback": validation_semantics_feedback,
         "per_dataset": per_dataset_results,
     }
     if violation_error:
@@ -1083,6 +1295,8 @@ try:
             return ds_name, {{
                 "nmse_train": ds_train_nmse,
                 "nmse_val": ds_nmse,
+                "shape_loss_val": float(result.get("shape_loss_val", 0.0)),
+                "scored_loss_val": float(result.get("scored_loss_val", ds_nmse)),
                 "n_val_points": int(result.get("n_val_points", 0)),
                 "evaluation_only": bool(result.get("evaluation_only", False)),
                 "combined_score": ds_combined,
@@ -1095,6 +1309,8 @@ try:
             return ds_name, {{
                 "nmse_train": float("inf"),
                 "nmse_val": float("inf"),
+                "shape_loss_val": float("inf"),
+                "scored_loss_val": float("inf"),
                 "n_val_points": int(len(y_val)),
                 "evaluation_only": bool(X_train.shape[0] == 0 and X_val.shape[0] > 0),
                 "combined_score": 0.0,
@@ -1152,18 +1368,33 @@ except Exception as exc:
 def _metrics_from_result(result: dict, eval_time: float) -> dict:
     """Normalize aggregated harness output into SkyDiscover evaluator metrics."""
     nmse_val = float(result.get("nmse_val", float("inf")))
-    combined = float(result.get("combined_score", combined_score_from_nmse(nmse_val)))
+    scored_loss_val = float(result.get("scored_loss_val", nmse_val))
+    combined = float(result.get("combined_score", combined_score_from_nmse(scored_loss_val)))
     if not np.isfinite(combined):
         combined = 0.0
 
     return {
         "equation": str(result.get("equation", "")),
-        "loss": nmse_val,
+        "loss": scored_loss_val,
         "complexity": float(result.get("complexity", 0.0)),
         "nmse_train": float(result.get("nmse_train", float("inf"))),
         "nmse_val": nmse_val,
         "mean_nmse_val": float(result.get("mean_nmse_val", nmse_val)),
         "mean_raw_nmse_val": float(result.get("mean_raw_nmse_val", nmse_val)),
+        "scored_loss_val": scored_loss_val,
+        "mean_scored_loss_val": float(result.get("mean_scored_loss_val", scored_loss_val)),
+        "shape_loss_val": float(result.get("shape_loss_val", 0.0)),
+        "shape_loss_weight": float(result.get("shape_loss_weight", SHAPE_LOSS_WEIGHT)),
+        "heldout_curve_nmse": float(result.get("heldout_curve_nmse", float("nan"))),
+        "heldout_curve_scored_loss": float(
+            result.get("heldout_curve_scored_loss", float("nan"))
+        ),
+        "heldout_curve_shape_loss": float(
+            result.get("heldout_curve_shape_loss", float("nan"))
+        ),
+        "eval_only_nmse": float(result.get("eval_only_nmse", float("nan"))),
+        "eval_only_scored_loss": float(result.get("eval_only_scored_loss", float("nan"))),
+        "eval_only_shape_loss": float(result.get("eval_only_shape_loss", float("nan"))),
         "combined_score": combined,
         "fit_score": float(result.get("fit_score", combined)),
         "parsimony_weight": float(result.get("parsimony_weight", PARSIMONY_WEIGHT)),
@@ -1174,6 +1405,9 @@ def _metrics_from_result(result: dict, eval_time: float) -> dict:
         "eval_workers": result.get("eval_workers", NUM_WORKERS),
         "hard_cases": result.get("hard_cases", []),
         "hard_case_feedback": str(result.get("hard_case_feedback", "")),
+        "validation_semantics_feedback": str(
+            result.get("validation_semantics_feedback", "")
+        ),
         "per_dataset": result.get("per_dataset", {}),
         "error": str(result.get("error", "")),
     }
@@ -1187,9 +1421,13 @@ def evaluate(program_path: str) -> dict:
         metrics = _metrics_from_result(result, time.time() - start)
         print(
             "Evaluation: "
+            f"scored_loss={metrics['scored_loss_val']:.6f}, "
             f"nmse_val={metrics['nmse_val']:.6f}, "
+            f"shape_loss={metrics['shape_loss_val']:.6f}, "
             f"mean_nmse_val={metrics['mean_nmse_val']:.6f}, "
             f"mean_raw_nmse_val={metrics['mean_raw_nmse_val']:.6f}, "
+            f"heldout_curve_scored_loss={metrics['heldout_curve_scored_loss']:.6f}, "
+            f"eval_only_scored_loss={metrics['eval_only_scored_loss']:.6f}, "
             f"combined_score={metrics['combined_score']:.6f}, "
             f"n_datasets={metrics['n_datasets']}, "
             f"n_successful={metrics['n_successful']}, "
@@ -1198,6 +1436,8 @@ def evaluate(program_path: str) -> dict:
         print(f"Equation template: {metrics['equation']}")
         if metrics.get("hard_case_feedback"):
             print(f"Hard-case feedback: {metrics['hard_case_feedback']}")
+        if metrics.get("validation_semantics_feedback"):
+            print(f"Validation semantics: {metrics['validation_semantics_feedback']}")
         if metrics.get("error"):
             print(f"Evaluator feedback: {metrics['error']}")
         return metrics
@@ -1212,12 +1452,23 @@ def evaluate(program_path: str) -> dict:
             "nmse_val": float("inf"),
             "mean_nmse_val": float("inf"),
             "mean_raw_nmse_val": float("inf"),
+            "scored_loss_val": float("inf"),
+            "mean_scored_loss_val": float("inf"),
+            "shape_loss_val": float("inf"),
+            "shape_loss_weight": SHAPE_LOSS_WEIGHT,
+            "heldout_curve_nmse": float("inf"),
+            "heldout_curve_scored_loss": float("inf"),
+            "heldout_curve_shape_loss": float("inf"),
+            "eval_only_nmse": float("inf"),
+            "eval_only_scored_loss": float("inf"),
+            "eval_only_shape_loss": float("inf"),
             "combined_score": 0.0,
             "eval_time": 0.0,
             "n_datasets": 0,
             "n_successful": 0,
             "hard_cases": [],
             "hard_case_feedback": "",
+            "validation_semantics_feedback": "",
             "per_dataset": {},
             "error": str(exc),
         }
