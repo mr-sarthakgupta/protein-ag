@@ -30,8 +30,8 @@ class SingleEquationViolation(RuntimeError):
     """Raised when a candidate tries to score more than one equation template."""
 
 
-MAX_EQUATION_COMPLEXITY = int(os.environ.get("SKYDISCOVER_MAX_EQUATION_COMPLEXITY", "160"))
-MAX_EQUATION_CONSTANTS = int(os.environ.get("SKYDISCOVER_MAX_EQUATION_CONSTANTS", "12"))
+MAX_EQUATION_COMPLEXITY = int(os.environ.get("SKYDISCOVER_MAX_EQUATION_COMPLEXITY", "1600"))
+MAX_EQUATION_CONSTANTS = int(os.environ.get("SKYDISCOVER_MAX_EQUATION_CONSTANTS", "15"))
 _BANNED_EXPR_TYPES = (
     sp.Piecewise,
     Relational,

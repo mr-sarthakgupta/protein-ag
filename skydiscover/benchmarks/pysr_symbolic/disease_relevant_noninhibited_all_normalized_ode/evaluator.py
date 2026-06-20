@@ -546,7 +546,7 @@ def _trajectory_preserving_split(
     curves = _curve_indices(X)
     rng = np.random.default_rng(RANDOM_STATE)
 
-    if len(curves) < 3:
+    if len(curves) < 6:
         empty_X = np.empty((0, X.shape[1]), dtype=float)
         empty_y = np.empty(0, dtype=float)
         return X, empty_X, y, empty_y
@@ -620,25 +620,13 @@ def load_all_datasets(
 
 
 NUM_WORKERS = int(os.environ.get("SKYDISCOVER_EVAL_WORKERS", min(8, os.cpu_count() or 4)))
-PARSIMONY_WEIGHT = float(os.environ.get("SKYDISCOVER_PARSIMONY_WEIGHT", "0.20"))
-PARSIMONY_COMPLEXITY_SCALE = float(
-    os.environ.get("SKYDISCOVER_PARSIMONY_COMPLEXITY_SCALE", "160")
-)
 SHAPE_LOSS_WEIGHT = float(os.environ.get("SKYDISCOVER_SHAPE_LOSS_WEIGHT", "0.25"))
 SHAPE_LOSS_WEIGHT = min(max(SHAPE_LOSS_WEIGHT, 0.0), 0.29)
 
 
-def _parsimony_penalty_factor(complexity: float) -> float:
-    """Bounded penalty factor for expression complexity."""
-    if not np.isfinite(complexity) or PARSIMONY_COMPLEXITY_SCALE <= 0:
-        return 1.0
-    normalized = min(max(float(complexity), 0.0) / PARSIMONY_COMPLEXITY_SCALE, 1.0)
-    return max(0.0, 1.0 - PARSIMONY_WEIGHT * normalized)
-
-
 def _gaussian_smooth_1d(values: np.ndarray, sigma: float = GAUSSIAN_SMOOTH_SIGMA) -> np.ndarray:
     values = np.asarray(values, dtype=float).ravel()
-    if values.size < 3 or sigma <= 0.0:
+    if values.size < 5 or sigma <= 0.0:
         return values
     radius = max(1, int(round(3.0 * sigma)))
     offsets = np.arange(-radius, radius + 1, dtype=float)
@@ -728,7 +716,7 @@ def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> 
     X = np.asarray(X, dtype=float)
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
-    if X.shape[0] != y_true.size or y_true.shape != y_pred.shape or y_true.size < 3:
+    if X.shape[0] != y_true.size or y_true.shape != y_pred.shape or y_true.size < 5:
         return 0.0
     if not np.all(np.isfinite(y_pred)):
         return 1.0
@@ -740,7 +728,7 @@ def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> 
     curve_losses: list[float] = []
     for curve_id in dict.fromkeys(np.asarray(curve_ids, dtype=int)):
         idx = np.flatnonzero(curve_ids == curve_id)
-        if idx.size < 3:
+        if idx.size < 5:
             continue
         order = idx[np.argsort(X[idx, 0])]
         x = X[order, 0]
@@ -907,7 +895,6 @@ def evaluate_ode_expression(
             "equation": f"d(c)/dt = {template}",
             "constants": {},
             "loss": float(np.mean((y_pred_fit - y_fit) ** 2)),
-            "complexity": equation_session._complexity(template),
             "nmse_train": nmse_train,
             "nmse_val": nmse_val,
             "shape_loss_val": shape_loss_val,
@@ -998,7 +985,6 @@ def evaluate_ode_expression(
         "equation": f"d(c)/dt = {fitted_expr}",
         "constants": fitted_constants,
         "loss": loss,
-        "complexity": equation_session._complexity(template),
         "nmse_train": nmse_train,
         "nmse_val": nmse_val,
         "shape_loss_val": shape_loss_val,
@@ -1055,16 +1041,6 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         for r in per_dataset_results.values()
         if np.isfinite(float(r.get("nmse_train", float("inf"))))
     ]
-    complexity_vals = []
-    for r in per_dataset_results.values():
-        try:
-            value = float(r.get("complexity", float("nan")))
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(value):
-            complexity_vals.append(value)
-    aggregate_complexity = float(max(complexity_vals)) if complexity_vals else 0.0
-
     violation_errors = sorted(
         {
             str(r.get("error"))
@@ -1241,8 +1217,7 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
             if np.isfinite(agg_scored_loss)
             else 0.0
         )
-        parsimony_factor = _parsimony_penalty_factor(aggregate_complexity)
-        agg_combined = raw_combined * parsimony_factor
+        agg_combined = raw_combined
         n_successful = sum(1 for value in nmse_vals if np.isfinite(value))
 
     validation_semantics_feedback = (
@@ -1276,11 +1251,6 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         ),
         "combined_score": agg_combined,
         "fit_score": raw_combined if not violation_error else 0.0,
-        "complexity": aggregate_complexity,
-        "parsimony_weight": PARSIMONY_WEIGHT,
-        "parsimony_penalty_factor": (
-            _parsimony_penalty_factor(aggregate_complexity) if not violation_error else 1.0
-        ),
         "n_datasets": len(scoring_results),
         "n_total_datasets": len(per_dataset_results),
         "n_train_only_datasets": len(per_dataset_results) - len(scoring_results),
@@ -1386,7 +1356,6 @@ try:
                 "n_val_points": int(result.get("n_val_points", 0)),
                 "evaluation_only": bool(result.get("evaluation_only", False)),
                 "combined_score": ds_combined,
-                "complexity": float(result.get("complexity", 0.0)),
                 "equation": str(result.get("equation", "")),
                 "equation_template": str(result.get("equation_template", "")),
                 "constants": result.get("constants", {{}}),
@@ -1462,7 +1431,6 @@ def _metrics_from_result(result: dict, eval_time: float) -> dict:
     return {
         "equation": str(result.get("equation", "")),
         "loss": scored_loss_val,
-        "complexity": float(result.get("complexity", 0.0)),
         "nmse_train": float(result.get("nmse_train", float("inf"))),
         "nmse_val": nmse_val,
         "mean_nmse_val": float(result.get("mean_nmse_val", nmse_val)),
@@ -1483,8 +1451,6 @@ def _metrics_from_result(result: dict, eval_time: float) -> dict:
         "eval_only_shape_loss": float(result.get("eval_only_shape_loss", float("nan"))),
         "combined_score": combined,
         "fit_score": float(result.get("fit_score", combined)),
-        "parsimony_weight": float(result.get("parsimony_weight", PARSIMONY_WEIGHT)),
-        "parsimony_penalty_factor": float(result.get("parsimony_penalty_factor", 1.0)),
         "eval_time": float(eval_time),
         "n_datasets": result.get("n_datasets", 0),
         "n_successful": result.get("n_successful", 0),
@@ -1533,7 +1499,6 @@ def evaluate(program_path: str) -> dict:
         return {
             "equation": "",
             "loss": float("inf"),
-            "complexity": 0.0,
             "nmse_train": float("inf"),
             "nmse_val": float("inf"),
             "mean_nmse_val": float("inf"),
