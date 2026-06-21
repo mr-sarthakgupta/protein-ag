@@ -22,35 +22,33 @@ def evaluate_symbolic_candidate(
     y_val: NDArray,
 ) -> dict[str, Any]:
     """
-    Propose an ODE right-hand side and let the harness fit its constants.
+    Generic bounded aggregation-rate ODE.
 
-    This candidate is evaluated independently on each dataset — the same
-    ODE template is used everywhere, but constants are fitted separately
-    per dataset.  This allows a single functional form to capture the
-    universal kinetic mechanism while the constants adapt to each protein
-    system's specific rates, concentrations, and timescales.
+    This seed starts from a broad mechanism class rather than a specific
+    closed-form solution: a concentration-independent source term can create
+    onset from near-zero signal, while an autocatalytic state-dependent term
+    can sharpen growth once aggregates are present.  Monomer and seed features
+    modulate both routes, and a capacity factor keeps the trajectory saturating
+    toward a fitted plateau.
 
-    Features: x0 = normalized elapsed time, x1 = m0 initial monomer
-    concentration, x2 = M0 seed concentration, x3 = concentration c.
-    Units are ignored by the cleaned-data loader; leading numeric values are
-    used directly.
-
-    Logistic-growth ODE template with parameter-dependent rate:
-
-        d(c)/dt = c0 * (1 + c1*x1 + c2*x2) * c * (c3 - c)
+    Features: x0 = normalized time, x1 = initial monomer m0, x2 = initial
+    seed/aggregate M0, and x3 = current normalized concentration/state.
     """
     x = feature_symbols(X_train.shape[1])
-    c = constant_symbols(4)
+    c = constant_symbols(9)
 
     time = x[0]
     monomer = x[1]
     seed = x[2]
     concentration = x[3]
 
-    rate = c[0] * (1 + c[1] * monomer + c[2] * seed)
-    plateau = c[3]
+    source_rate = c[0] ** 2 * monomer ** c[1] + c[2] ** 2 * seed
+    autocatalytic_rate = c[3] ** 2 * monomer ** c[4] * (1 + c[5] ** 2 * seed)
+    baseline_flux = c[6] ** 2
+    plateau = c[7]
+    capacity = plateau - concentration
 
-    expression = rate * concentration * (plateau - concentration)
+    expression = capacity * (baseline_flux + source_rate + autocatalytic_rate * concentration) + c[8] * time * capacity
 
     return evaluate_expression(
         expression,
@@ -59,7 +57,7 @@ def evaluate_symbolic_candidate(
         X_val,
         y_val,
         constants=c,
-        initial_values=[1.0, 0.0, 0.0, 1.0],
+        initial_values=[0.3, 0.5, 0.1, 1.0, 0.5, 0.0, 0.01, 1.0, 0.0],
     )
 
 

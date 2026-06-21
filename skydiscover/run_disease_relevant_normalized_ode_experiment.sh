@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # ── Configuration (override via environment) ─────────────────────────
-MAX_COST="${MAX_COST:-35}"
-ITERATIONS="${ITERATIONS:-30}"
+MAX_COST="${MAX_COST:-45}"
+ITERATIONS="${ITERATIONS:-100}"
 SEARCH="${SEARCH:-adaevolve}"  # supported: adaevolve, evox
 ALLOW_SMOKE_FAIL="${ALLOW_SMOKE_FAIL:-0}"
 # Keep Bedrock calls pinned to the repo-standard region.

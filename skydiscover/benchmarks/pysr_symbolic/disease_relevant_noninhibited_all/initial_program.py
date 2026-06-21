@@ -22,36 +22,37 @@ def evaluate_symbolic_candidate(
     y_val: NDArray,
 ) -> dict[str, Any]:
     """
-    Propose an equation structure and let the harness fit its constants.
+    Generic two-channel bounded growth template.
 
-    This candidate is evaluated independently on each dataset — the same
-    equation template is used everywhere, but constants are fitted separately
-    per dataset.  This allows a single functional form to capture the
-    universal kinetic mechanism while the constants adapt to each protein
-    system's specific rates, concentrations, and timescales.
+    This seed is intentionally broad rather than tied to one closed-form law:
+    one channel is a lag-capable stretched rise, the other is an immediate
+    seed-sensitive rise.  A smooth seed-dependent weight lets the fitted
+    constants interpolate between unseeded, lag-dominated curves and seeded,
+    fast-onset curves while preserving one shared symbolic structure across
+    all datasets.
 
-    Features: x0 = normalized elapsed time, x1 = m0 initial monomer
-    concentration, x2 = static initial M0 seed/aggregate concentration.
-    Units are ignored by the cleaned-data loader; leading numeric values are
-    used directly.
-
-    Logistic/sigmoidal template with concentration-dependent rate and
-    half-time — a natural model for nucleation-dependent polymerization:
-
-        y = c4 / (1 + exp(-c0 * x1^c1 * (x0 - c2 * x1^c3))) + c5
+    Features: x0 = normalized elapsed time, x1 = initial monomer m0, and
+    x2 = static seed/aggregate M0.  All sub-curves are bounded in [0, 1) on
+    the observed domain, then an affine output calibration handles per-dataset
+    response normalization.
     """
     x = feature_symbols(X_train.shape[1])
-    c = constant_symbols(6)
+    c = constant_symbols(10)
 
     time = x[0]
-    parameter = x[1]
+    monomer = x[1]
+    seed = x[2]
 
-    rate = c[0] * parameter ** c[1]
-    half_time = c[2] * parameter ** c[3]
-    plateau = c[4]
-    baseline = c[5]
+    lag_rate = c[0] ** 2 * monomer ** c[1]
+    fast_rate = c[2] ** 2 * monomer ** c[3] * sp.exp(c[4] * seed)
+    stretch = sp.exp(c[5])
+    weight = 1 / (1 + sp.exp(-(c[6] + c[7] * seed)))
+    plateau = c[8]
+    baseline = c[9]
 
-    expression = plateau / (1 + sp.exp(-rate * (time - half_time))) + baseline
+    lagged_growth = 1 - sp.exp(-lag_rate * time ** stretch)
+    fast_growth = 1 - sp.exp(-fast_rate * time)
+    expression = plateau * ((1 - weight) * lagged_growth + weight * fast_growth) + baseline
 
     return evaluate_expression(
         expression,
@@ -60,7 +61,7 @@ def evaluate_symbolic_candidate(
         X_val,
         y_val,
         constants=c,
-        initial_values=[0.1, 0.5, 10.0, -0.5, 1.0, 0.0],
+        initial_values=[1.0, 0.5, 1.0, 0.5, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0],
     )
 
 
