@@ -72,6 +72,8 @@ ODE_MULTISTART_SCALES = tuple(
     for value in os.environ.get("SKYDISCOVER_ODE_MULTISTART_SCALES", "1.0,0.3,3.0").split(",")
     if value.strip()
 )
+ODE_CURVE_WORKERS = int(os.environ.get("SKYDISCOVER_ODE_CURVE_WORKERS", "1"))
+ODE_MULTISTART_WORKERS = int(os.environ.get("SKYDISCOVER_ODE_MULTISTART_WORKERS", "1"))
 SINGLE_EQUATION_ERROR_PREFIX = "Single-equation violation"
 _ARRAY_CURVE_IDS: dict[int, np.ndarray] = {}
 _ALLOWED_IMPORTS = {"sympy", "numpy"}
@@ -786,16 +788,16 @@ def _ode_predictions(
     y_known = np.asarray(y_known, dtype=float).reshape(-1)
     theta = np.asarray(theta, dtype=float).reshape(-1)
     predictions = np.full_like(y_known, np.nan, dtype=float)
+    curve_indices = list(_curve_indices(X))
 
-    for curve_idx in _curve_indices(X):
+    def integrate_curve(curve_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         ordered_idx = curve_idx[np.argsort(X[curve_idx, 0])]
         times = X[ordered_idx, 0]
         observed = y_known[ordered_idx]
         static_features = [float(value) for value in X[ordered_idx[0], 1:-1]]
 
         if len(ordered_idx) == 1 or float(times[-1] - times[0]) <= 0.0:
-            predictions[ordered_idx] = observed[0]
-            continue
+            return ordered_idx, np.full_like(observed, observed[0], dtype=float)
 
         def dc_dt(c_state: np.ndarray, time_value: float) -> float:
             c_value = float(np.asarray(c_state, dtype=float).reshape(-1)[0])
@@ -816,6 +818,16 @@ def _ode_predictions(
         curve_pred = np.asarray(integrated, dtype=float).reshape(-1)
         if curve_pred.shape != observed.shape or not np.all(np.isfinite(curve_pred)):
             raise FloatingPointError("non-finite ODE trajectory")
+        return ordered_idx, curve_pred
+
+    max_curve_workers = min(max(ODE_CURVE_WORKERS, 1), len(curve_indices) or 1)
+    if max_curve_workers <= 1:
+        curve_results = [integrate_curve(curve_idx) for curve_idx in curve_indices]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_curve_workers) as executor:
+            curve_results = list(executor.map(integrate_curve, curve_indices))
+
+    for ordered_idx, curve_pred in curve_results:
         predictions[ordered_idx] = curve_pred
 
     return predictions
@@ -935,17 +947,33 @@ def evaluate_ode_expression(
 
     best_fit = None
     best_loss = float("inf")
+
+    def fit_initial_candidate(initial_candidate: np.ndarray):
+        fit = least_squares(
+            residual,
+            initial_candidate,
+            loss="soft_l1",
+            max_nfev=max_nfev,
+        )
+        fit_residual = residual(fit.x)
+        fit_loss = float(np.mean(fit_residual**2))
+        return fit, fit_loss
+
     with warnings.catch_warnings(), np.errstate(over="ignore", divide="ignore", invalid="ignore"):
         warnings.simplefilter("ignore", RuntimeWarning)
-        for initial_candidate in initial_candidates:
-            fit = least_squares(
-                residual,
-                initial_candidate,
-                loss="soft_l1",
-                max_nfev=max_nfev,
-            )
-            fit_residual = residual(fit.x)
-            fit_loss = float(np.mean(fit_residual**2))
+        max_multistart_workers = min(
+            max(ODE_MULTISTART_WORKERS, 1),
+            len(initial_candidates) or 1,
+        )
+        if max_multistart_workers <= 1:
+            fit_results = [fit_initial_candidate(candidate) for candidate in initial_candidates]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_multistart_workers
+            ) as executor:
+                fit_results = list(executor.map(fit_initial_candidate, initial_candidates))
+
+        for fit, fit_loss in fit_results:
             if fit_loss < best_loss:
                 best_loss = fit_loss
                 best_fit = fit

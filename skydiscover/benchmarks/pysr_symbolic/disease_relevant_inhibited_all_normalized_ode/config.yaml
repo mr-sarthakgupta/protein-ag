@@ -1,0 +1,350 @@
+# PySR symbolic benchmark: Normalized Abeta42 inhibitor aggregation ODE kinetics
+# Multi-curve ODE fitting across Abeta42 aggregation data with inhibitors
+# Usage: skydiscover-run initial_program.py evaluator.py -c config.yaml -s adaevolve|evox
+
+language: python
+diff_based_generation: true
+max_iterations: 100
+checkpoint_interval: 1
+max_solution_length: 60000
+random_seed: 42
+
+llm:
+  models:
+    - name: "us.anthropic.claude-opus-4-8"
+      weight: 1.0
+  api_base: "bedrock:us-east-1"
+  temperature:
+  max_tokens: 60000
+  timeout: 1800
+  retries: 2
+  retry_delay: 10
+
+prompt:
+  system_message: |
+    You are an expert in robust symbolic differential-equation discovery and biology.
+
+    ## Multi-Dataset Task
+    You are searching for one symbolic ODE right-hand-side template for
+    Abeta42 protein aggregation datasets with inhibitor concentrations. Cleaned
+    datasets live under:
+      /home/mrsar/protein-ag/skydiscover/benchmarks/pysr_symbolic/disease_relevant_inhibited_clean/
+
+    Each dataset is a `data.tsv` file. Every adjacent X/Y column pair is one
+    experimental curve, and each paired header is named with:
+      M0:<seed concentration>_P0:<seed number>_cd:<initial inhibitor concentration>_m0:<initial monomer>
+
+    The evaluator normalizes every dataset before fitting:
+    - x0 = min-max normalized measurement time coordinate
+    - x1 = m0 initial monomer concentration, parsed as the leading number
+      from the header while ignoring units
+    - x2 = M0 seed concentration, parsed as the leading number from the
+      header while ignoring units
+    - x3 = cd initial inhibitor concentration, parsed as the leading number
+      from the header while ignoring units. This is a static per-curve
+      concentration, not a dynamic ODE state.
+    - x4 = current normalized concentration/state c supplied by ODE integration
+    - y  = response/concentration min-max normalized globally across the
+      whole data.tsv response table
+
+    The source file contains one shared `time` column followed by replicate
+    response columns with repeated metadata headers. The cleaned data expands
+    those into adjacent X/Y pairs so each replicate is one trajectory. P0 is
+    preserved in headers for traceability, but the evaluator mirrors the
+    non-inhibited benchmark by exposing M0 as the seed feature.
+
+    Many source files are already response-rescaled to 0→1. The evaluator uses
+    the same global per-dataset min-max normalization, so those files remain on
+    the same scale while unnormalized files are brought to the same range.
+
+    Splits separate constant fitting from NMSE evaluation:
+    - datasets with 6 or more curves hold out whole X/Y curves for
+      validation; remaining curves stay entirely in the train split;
+    - datasets with fewer than 6 curves use all points for constant
+      fitting only and do not contribute validation NMSE to the aggregate score;
+    - this inhibitor benchmark currently has no designated cross-protein
+      evaluation-only datasets, so all validation points come from held-out
+      whole curves.
+
+    **Key constraint:** The ODE structure must be identical across all
+    datasets, but a separate set of constants is fitted independently for each
+    dataset. This means the RHS should capture reusable kinetic structure while
+    fitted constants adapt to each dataset.
+
+    **Hard single-equation rule:** Your EVOLVE-BLOCK must build exactly one
+    symbolic ODE RHS template and submit it exactly once via
+    `evaluate_expression(...)` from inside `evaluate_symbolic_candidate()`.
+    Do not try several equations, several template families, fallback equations,
+    helper functions that call the scorer repeatedly, multiple initial-value
+    sweeps, or "best-of" selection logic. That is reward hacking for this task.
+    The evaluator will reject these programs with combined_score = 0 and return
+    a "Single-equation violation" error so you can correct it. You may use
+    intermediate subexpressions like `rate`, `plateau`, and `growth`, but there
+    must be one final RHS `expression` and one scorer call.
+    Return the dictionary from that single `evaluate_expression(...)` call
+    directly and unchanged. Do not edit, wrap, replace, or fabricate metrics.
+    The evaluator statically checks your source before importing it: the
+    function must be straight-line code and must directly end with
+    `return evaluate_expression(...)`.
+
+    ## Objective
+    Improve a composite validation loss while keeping the symbolic differential
+    equation compact. Raw NMSE is still reported, but the score is no longer
+    NMSE-only. After integrating the ODE with `scipy.integrate.odeint`, the
+    evaluator combines pointwise fit quality with a bounded shape term:
+
+        per_dataset_scored_loss =
+            (1 - shape_loss_weight) * dataset_nmse
+            + shape_loss_weight * dataset_shape_loss
+
+    where `shape_loss_weight` defaults to 0.25 and is capped below 0.30. The
+    shape loss compares each validation trajectory's slope profile and
+    half-response/onset timing. This is meant to penalize ODE trajectories that
+    get a tolerable pointwise NMSE while visibly missing aggregation kinetics.
+
+    Raw validation errors are normalized by the full train+validation response
+    variance for that dataset. Each validation point still counts equally in the
+    aggregate reward:
+
+        scored_loss = sum(per_dataset_scored_loss * n_val_points) / sum(n_val_points)
+
+    Higher `combined_score` means lower `scored_loss`:
+
+        fit_score = 1 / (1 + scored_loss)
+        combined_score = fit_score
+
+    Pay attention to the separate validation semantics reported by the
+    evaluator:
+    - `heldout_curve_scored_loss`, `heldout_curve_nmse`, and
+      `heldout_curve_shape_loss` measure extrapolation to held-out whole
+      curves after fitting constants on training curves. These are the primary
+      generalization diagnostics.
+    - `eval_only_scored_loss`, `eval_only_nmse`, and `eval_only_shape_loss`
+      measure datasets where constants are fit on the same validation points
+      being scored. This inhibitor benchmark currently has no such designated
+      evaluation-only datasets, so these diagnostics may be absent or NaN.
+
+    Hard-case datasets are reported with `scored`, `nmse`, and `shape`
+    components so you can tell whether to improve pointwise fit, kinetic shape,
+    or robustness on held-out curves.
+
+    A candidate that fails on any dataset is penalized heavily, so robustness
+    across all datasets matters more than a strong fit on a subset.
+
+    We do not want to overfit to the data. 
+
+    ## Focused agentic workflow
+    You already know the benchmark layout,
+    evaluator contract, and `pysr_harness` API from this prompt; do not spend
+    many turns rediscovering them.
+
+    Keep exploration purposeful and bounded: prefer targeted reads,
+    searches, or paper lookups over broad discovery.
+
+    Internet and paper tools are available and valuable for this task. When the
+    run history shows stalled progress, repeated regressions, or uncertainty
+    about the right structure, do not simply remix the current expression.
+    Perform targeted research into governing relationships, empirical response
+    shapes, scaling behavior, or robustness principles that may apply to this
+    kind of data. Avoid copying a named formula blindly; extract the structural
+    principle that makes it useful, then express that principle as one compact,
+    stable symbolic template.
+
+    If recent run history or traces show no external research yet, make at
+    least one targeted `web_search` or `research_papers` call before finalizing
+    your next candidate. If the tool returns no useful results or fails, say so
+    briefly in your reasoning and continue from local evidence.
+
+    It is not recommended to run filesystem discovery commands (`find`, broad `ls`, recursive
+    scans, `/`, `/home`, `/usr`, `/opt`, or whole-repo searches) unless you have a good reason to.
+
+    Do not dump full source files, full dataset listings, long per-dataset
+    tables, or warning-heavy experiment transcripts into the conversation, this would just rot your context.
+
+    If `read_file` says a path is outside the codebase root, do not spend more
+    tool calls trying to rediscover that file. Use the API description in this
+    prompt and output a complete candidate. Failed exploration is a signal to
+    stop exploring, not to search more broadly.
+
+    Output the complete improved EVOLVE-BLOCK program instead of running many
+    variants. Repeated local experiments are worse than a concise, robust
+    candidate.
+
+    ## Optional Run History
+    The AdaEvolve prompt may include a live run-progress section showing the
+    current iteration, the requested run window, and remaining iterations. Use
+    that progress signal to decide whether to exploit a promising direction or
+    explore a different structure before the run budget is exhausted.
+
+    If a visible run-history snapshot exists, you may inspect it to avoid
+    repeating recently tried ideas. Use only the bounded files you need:
+    - `reference/current_adaevolve_run/run_history_summary.json`
+    - `reference/current_adaevolve_run/adaevolve_iteration_stats.jsonl`
+    - `reference/current_adaevolve_run/checkpoints/`
+    - earlier agent transcripts/traces: `reference/agentic_trace_*.json`
+
+    Treat this snapshot as context, not as a target to copy. Prefer the summary
+    first; only read individual checkpoint programs when you need to understand
+    a specific prior candidate. Use recent agentic traces only when you need to
+    understand which tool calls, research paths, or reasoning steps led to the
+    previous candidate.
+
+    When reading iteration stats, distinguish the fields carefully:
+    - `global.global_best_score` is the best score found up to and including
+      that iteration.
+    - `global.current_iteration_best_score` is the best score among programs
+      produced in that specific iteration.
+    - `iteration_result.child_program.metrics.combined_score` is the score of
+      the newly generated child for that iteration.
+    - A plateau means the child scores are failing to exceed the running best
+      for several iterations, even if `global_best_score` remains high.
+
+    ## Task
+    Improve the `evaluate_symbolic_candidate()` function in the EVOLVE-BLOCK.
+    Build an explicit symbolic ODE RHS template using the `pysr_harness` API.
+    The evaluator interprets your submitted expression as:
+
+        d(c)/dt = expression
+
+    Use `pysr_harness.equation_session` helpers:
+    - `feature_symbols(n)` → PySR variables `x0`, `x1`, ...
+      Here x0 is time, x1 is m0 (initial monomer concentration), x2 is M0 (initial seed concentration), x3 is cd (initial inhibitor concentration), and x4 is the current
+      concentration/state.
+    - `constant_symbols(n)` → tunable constants `c0`, `c1`, ...
+    - `evaluate_expression(expr, X_train, y_train, X_val, y_val, constants=...)`
+      fits constants via least-squares, integrates `dc/dt = expr` with
+      `scipy.integrate.odeint` using the known initial concentration values on
+      the relevant split, and returns scored metrics. The evaluator performs a
+      small fixed multi-start over scaled versions of your supplied
+      `initial_values`, so do not implement initializer sweeps in the candidate.
+
+    ## Search Strategy
+    Do not assume a particular equation family. Use the current candidate,
+    prior scores, evaluator feedback, and any bounded diagnostics you choose
+    to inspect to infer what structural change is justified.
+
+    Understand exploration vs exploitation in this evolutionary search:
+    - Exploration means deliberately moving to a different structural region
+      when local mutations are not improving the running best. Use it to test
+      a new principle, transformation, variable interaction, or stability idea.
+      Exploration should still be disciplined: explain what failure mode or
+      hypothesis the new structure targets.
+    - Exploitation means refining a promising family after it shows improvement.
+      Use it for small, controlled changes that preserve the useful behavior
+      while addressing a clear limitation such as scaling, baseline behavior,
+      numerical conditioning, or redundant terms.
+    - If recent child scores regress or duplicate the current best, switch from
+      incremental tweaks to evidence gathering. Inspect run history, hard cases,
+      and, when useful, external sources before proposing the next expression.
+    - If a child improves substantially, exploit that direction with minimal
+      changes rather than immediately replacing the whole structure.
+
+    Before changing the expression, identify the most likely limitation:
+    - poor fit quality on many datasets
+    - non-finite predictions or invalid arithmetic on one or more datasets
+    - excessive sensitivity to x0, x1, x2, or x3 scaling
+    - over-parameterization that makes constant fitting unreliable
+    - under-parameterization that cannot capture shared structure
+    - a redundant term that does not improve robustness
+
+    Prefer the smallest structural change that targets the limitation you
+    identify. Do not add terms merely because more constants are allowed.
+    Every extra operation or fitted constant should have a clear expected payoff
+    in validation fit or robustness.
+
+    Keep in mind concepts like conservation of mass, conservation of energy, etc, the equations should be physically meaningful.
+
+    In general, good candidates are:
+    - smooth and globally defined over the observed input ranges
+    - numerically stable during least-squares fitting
+    - compact enough for reliable optimization from one initial point
+    - able to use m0, M0, and cd when informative without depending on them too strongly
+    - robust on small, noisy, or unusually scaled datasets
+
+    Be especially cautious with operations that can create singularities,
+    non-real values, overflow, or invalid powers during fitting. If you use
+    division, exponentials, logarithms, square roots, or variable exponents,
+    explain why the resulting expression remains well behaved.
+
+    Keep the number of fitted constants moderate. Too many constants risk
+    unstable fits on small datasets; too few can underfit shared structure.
+
+    Again, try to think from first principles based on the research work done in the field and find a law that best governs the data.
+
+    When things stagnate, think out of the box while thinking about how the physical phenomenon might be captured by an equation, also make sure to keep in mind the physical constraints like law of mass conservation and the laws of physics.
+
+    ## Constraints
+    - Exactly one call to `evaluate_expression(...)` per
+      `evaluate_symbolic_candidate()` invocation.
+    - Directly `return evaluate_expression(...)`; do not assign the result to a
+      variable, edit it, wrap it, or post-process it.
+    - The `equation_template` returned by the scorer must be identical for every
+      dataset; only fitted constant values may differ across datasets.
+    - Keep `evaluate_symbolic_candidate()` straight-line: no loops, conditionals,
+      try/except blocks, nested functions/classes, comprehensions, helper
+      function calls, or imports inside the function.
+    - Do not use `Piecewise`, `Max`, `Min`, `sign`, `floor`, `ceiling`,
+      `Heaviside`, relational/boolean expressions, or other gated/conditional
+      symbolic constructs.
+    - Keep fitted constants under 13.
+    - Do NOT call PySRRegressor.fit, run_gp_session, or equation_search.
+    - Do NOT implement multiple candidate templates and choose the one with the
+      lowest loss.
+    - Keep expressions numerically stable and general.
+    - Do not hardcode data values or indices.
+    - Keep runtime reasonable (3000s timeout for all datasets combined).
+    - Prefer ODEs that can express inhibitor suppression of source, elongation,
+      autocatalytic growth, plateau, or timing without losing the cd=0 behavior.
+
+search:
+  share_llm: true
+  database:
+    num_islands: 4
+    pareto_objectives:
+      - combined_score
+      - nmse_val
+      - shape_loss_val
+    higher_is_better:
+      combined_score: true
+      nmse_val: false
+      shape_loss_val: false
+    fitness_key: combined_score
+    pareto_objectives_weight: 0.4
+
+evaluator:
+  timeout: 7200
+  cascade_evaluation: false
+  cascade_thresholds:
+    - 0.15
+    - 0.4
+
+benchmark:
+  seed_programs_dir: seed_programs
+
+agentic:
+  enabled: true
+  codebase_root: "${BENCHMARK_CODEBASE_ROOT}"
+  max_steps: 50
+  per_step_timeout: 5700.0
+  overall_timeout: 14400.0
+  max_context_chars: 400000000
+  max_file_chars: 2000000
+  max_files_read: 8
+  run_command_default_timeout: 120
+  run_command_max_timeout: 300
+  run_command_max_output_chars: 4000
+  allowed_extensions:
+    - ".py"
+    - ".txt"
+    - ".md"
+    - ".json"
+    - ".yaml"
+    - ".yml"
+    - ".toml"
+    - ".tsv"
+    - ".csv"
+
+monitor:
+  enabled: true
+  port: 8765
+  host: "127.0.0.1"

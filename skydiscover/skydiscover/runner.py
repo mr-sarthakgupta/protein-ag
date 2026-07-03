@@ -49,6 +49,7 @@ class Runner:
         evaluator_env_vars: Optional[dict[str, str]] = None,
     ):
         self.config = config if config is not None else load_config(config_path)
+        self.config_path = config_path
         self.name = self.config.search.type
         self.output_dir = output_dir or build_output_dir(
             self.name, initial_program_path or "scratch"
@@ -72,6 +73,7 @@ class Runner:
         self.file_extension = ext if ext.startswith(".") else f".{ext}"
         if self.config.file_suffix == ".py":
             self.config.file_suffix = self.file_extension
+        self.additional_initial_programs = self._load_additional_initial_programs()
 
         # Create the database
         self.database = create_database(self.config.search.type, self.config.search.database)
@@ -155,6 +157,7 @@ class Runner:
 
         if should_add_initial:
             await self._add_initial_program(start_iteration)
+            await self._add_additional_initial_programs(start_iteration)
         else:
             logger.info(
                 f"Resuming from iteration {start_iteration} with {len(self.database.programs)} programs"
@@ -276,8 +279,20 @@ class Runner:
     # Initial program
     # ------------------------------------------------------------------
 
-    async def _add_initial_program(self, start_iteration: int) -> None:
-        logger.info("Adding initial program to database")
+    async def _add_initial_program(
+        self,
+        start_iteration: int,
+        *,
+        solution: Optional[str] = None,
+        source_path: Optional[str] = None,
+        target_island: Optional[int] = None,
+    ) -> Optional[Program]:
+        seed_solution = solution if solution is not None else self.initial_program_solution
+        if seed_solution is None:
+            return None
+
+        seed_label = source_path or self.initial_program_path or "initial program"
+        logger.info(f"Adding initial program to database: {seed_label}")
         program_id = str(uuid.uuid4())
 
         initial_image_path = None
@@ -287,7 +302,7 @@ class Runner:
             try:
                 result = await self.discovery_controller.llms.generate(
                     system_message="Generate an image based on the following description. Also provide brief reasoning about your creative choices.",
-                    messages=[{"role": "user", "content": self.initial_program_solution}],
+                    messages=[{"role": "user", "content": seed_solution}],
                     image_output=True,
                     output_dir=img_dir,
                     program_id=program_id,
@@ -300,7 +315,7 @@ class Runner:
         eval_input = (
             initial_image_path
             if self.config.language == "image" and initial_image_path
-            else self.initial_program_solution
+            else seed_solution
         )
         eval_result = await self.discovery_controller.evaluator.evaluate_program(
             eval_input, program_id
@@ -311,20 +326,41 @@ class Runner:
             initial_image_path = metrics.pop("image_path")
 
         program = get_program(
-            self.config, self.initial_program_solution, program_id, metrics, start_iteration
+            self.config, seed_solution, program_id, metrics, start_iteration
         )
         program.artifacts = eval_result.artifacts
+        program.metadata = program.metadata or {}
+        program.metadata["seed_source"] = seed_label
 
         if initial_image_path:
-            program.metadata = program.metadata or {}
             program.metadata["image_path"] = initial_image_path
 
-        self.database.add(program)
+        self.database.add(program, iteration=start_iteration, target_island=target_island)
         try:
-            self.database.initial_program_id = program.id
-            self.database.initial_program_score = get_score(program.metrics or {})
+            if solution is None:
+                self.database.initial_program_id = program.id
+                self.database.initial_program_score = get_score(program.metrics or {})
         except Exception as e:
             logger.warning(f"Failed to set initial program score: {e}")
+        return program
+
+    async def _add_additional_initial_programs(self, start_iteration: int) -> None:
+        if not self.additional_initial_programs:
+            return
+
+        logger.info(f"Adding {len(self.additional_initial_programs)} additional seed programs")
+        for idx, (source_path, solution) in enumerate(self.additional_initial_programs):
+            target_island = None
+            if getattr(self.database, "num_islands", 0):
+                # The primary seed starts on island 0; offset variants to keep
+                # an even 80-seed spread across four islands.
+                target_island = (idx + 1) % self.database.num_islands
+            await self._add_initial_program(
+                start_iteration,
+                solution=solution,
+                source_path=source_path,
+                target_island=target_island,
+            )
 
     # ------------------------------------------------------------------
     # Monitor and feedback setup
@@ -433,6 +469,29 @@ class Runner:
     def _load_initial_program(self) -> str:
         with open(self.initial_program_path, "r") as f:
             return f.read()
+
+    def _load_additional_initial_programs(self) -> list[tuple[str, str]]:
+        params = getattr(getattr(self.config, "benchmark", None), "params", {}) or {}
+        seed_dir = params.get("seed_programs_dir")
+        if not seed_dir:
+            return []
+
+        seed_path = Path(seed_dir)
+        if not seed_path.is_absolute():
+            base_path = Path(self.initial_program_path).resolve().parent if self.initial_program_path else Path.cwd()
+            seed_path = base_path / seed_path
+
+        if not seed_path.exists():
+            logger.warning(f"Configured seed_programs_dir does not exist: {seed_path}")
+            return []
+
+        programs: list[tuple[str, str]] = []
+        for path in sorted(seed_path.glob(f"*{self.file_extension}")):
+            if path.resolve() == Path(self.initial_program_path).resolve():
+                continue
+            with path.open("r") as f:
+                programs.append((str(path), f.read()))
+        return programs
 
     def _save_checkpoint(self, iteration: int) -> None:
         checkpoint_dir = os.path.join(self.output_dir, "checkpoints")
