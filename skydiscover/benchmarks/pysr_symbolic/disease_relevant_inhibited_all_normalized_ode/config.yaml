@@ -27,15 +27,17 @@ prompt:
     ## Multi-Dataset Task
     You are searching for one symbolic ODE right-hand-side template for
     Abeta42 protein aggregation datasets with inhibitor concentrations. Cleaned
-    datasets live under:
+    dataset live under:
       /home/mrsar/protein-ag/skydiscover/benchmarks/pysr_symbolic/disease_relevant_inhibited_clean/
 
-    Each dataset is a `data.tsv` file. Every adjacent X/Y column pair is one
+    The datasets are `data.tsv` files. Every adjacent X/Y column pair is one
     experimental curve, and each paired header is named with:
       M0:<seed concentration>_P0:<seed number>_cd:<initial inhibitor concentration>_m0:<initial monomer>
 
+    please note that for the current run, there is only a single dataset with 192 curves corresponding to a single protein only, so proceed accordingly
+
     The evaluator normalizes every dataset before fitting:
-    - x0 = min-max normalized measurement time coordinate
+    - x0 = min-max normalized measurement time coordinate (the X)
     - x1 = m0 initial monomer concentration, parsed as the leading number
       from the header while ignoring units
     - x2 = M0 seed concentration, parsed as the leading number from the
@@ -43,15 +45,13 @@ prompt:
     - x3 = cd initial inhibitor concentration, parsed as the leading number
       from the header while ignoring units. This is a static per-curve
       concentration, not a dynamic ODE state.
-    - x4 = current normalized concentration/state c supplied by ODE integration
+    - x4 = current normalized concentration/state c supplied by ODE integration (the Y)
     - y  = response/concentration min-max normalized globally across the
       whole data.tsv response table
 
     The source file contains one shared `time` column followed by replicate
     response columns with repeated metadata headers. The cleaned data expands
-    those into adjacent X/Y pairs so each replicate is one trajectory. P0 is
-    preserved in headers for traceability, but the evaluator mirrors the
-    non-inhibited benchmark by exposing M0 as the seed feature.
+    those into adjacent X/Y pairs so each replicate is one trajectory.
 
     Many source files are already response-rescaled to 0→1. The evaluator uses
     the same global per-dataset min-max normalization, so those files remain on
@@ -98,9 +98,12 @@ prompt:
             + shape_loss_weight * dataset_shape_loss
 
     where `shape_loss_weight` defaults to 0.25 and is capped below 0.30. The
-    shape loss compares each validation trajectory's slope profile and
-    half-response/onset timing. This is meant to penalize ODE trajectories that
-    get a tolerable pointwise NMSE while visibly missing aggregation kinetics.
+    shape loss is curve-level: each held-out trajectory contributes one shape
+    loss regardless of how many plateau points it contains. It compares slope
+    profile plus response-crossing timing at 10%, 25%, 50%, 75%, and 90%.
+    The final shape loss blends the mean curve loss with a high-quantile
+    worst-curve term, so a few visibly wrong delayed or slow inhibitor curves
+    cannot be hidden by many easy saturating trajectories.
 
     Raw validation errors are normalized by the full train+validation response
     variance for that dataset. Each validation point still counts equally in the
@@ -252,7 +255,7 @@ prompt:
     Every extra operation or fitted constant should have a clear expected payoff
     in validation fit or robustness.
 
-    Keep in mind concepts like conservation of mass, conservation of energy, etc, the equations should be physically meaningful.
+    Keep in mind concepts like conservation of mass, conservation of energy, etc, the equations should be physically meaningful. Also think about how inhibition might actually happen at a molecular level
 
     In general, good candidates are:
     - smooth and globally defined over the observed input ranges

@@ -74,6 +74,18 @@ ODE_MULTISTART_SCALES = tuple(
 )
 ODE_CURVE_WORKERS = int(os.environ.get("SKYDISCOVER_ODE_CURVE_WORKERS", "1"))
 ODE_MULTISTART_WORKERS = int(os.environ.get("SKYDISCOVER_ODE_MULTISTART_WORKERS", "1"))
+SHAPE_TIMING_LEVELS = tuple(
+    float(value)
+    for value in os.environ.get(
+        "SKYDISCOVER_SHAPE_TIMING_LEVELS",
+        "0.1,0.25,0.5,0.75,0.9",
+    ).split(",")
+    if value.strip()
+)
+SHAPE_WORST_CURVE_WEIGHT = min(
+    max(float(os.environ.get("SKYDISCOVER_SHAPE_WORST_CURVE_WEIGHT", "0.3")), 0.0),
+    1.0,
+)
 SINGLE_EQUATION_ERROR_PREFIX = "Single-equation violation"
 _ARRAY_CURVE_IDS: dict[int, np.ndarray] = {}
 _ALLOWED_IMPORTS = {"sympy", "numpy"}
@@ -714,7 +726,7 @@ def _half_response_time(x: np.ndarray, y: np.ndarray, level: float = 0.5) -> flo
 
 
 def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Bounded shape mismatch based on curve slopes and half-response timing."""
+    """Bounded curve-level shape mismatch with multi-level timing penalties."""
     X = np.asarray(X, dtype=float)
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
@@ -750,20 +762,34 @@ def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> 
             else _bounded_loss(slope_raw)
         )
 
-        true_half = _half_response_time(x, true_curve)
-        pred_half = _half_response_time(x, pred_curve)
-        if true_half is None and pred_half is None:
-            timing_loss = 0.0
-        elif true_half is None or pred_half is None:
-            timing_loss = 1.0
-        else:
-            timing_loss = min(abs(float(pred_half) - float(true_half)), 1.0)
+        timing_losses: list[float] = []
+        for level in SHAPE_TIMING_LEVELS:
+            if level <= 0.0 or level >= 1.0:
+                continue
+            true_crossing = _half_response_time(x, true_curve, level=level)
+            pred_crossing = _half_response_time(x, pred_curve, level=level)
+            if true_crossing is None and pred_crossing is None:
+                timing_losses.append(0.0)
+            elif true_crossing is None or pred_crossing is None:
+                timing_losses.append(1.0)
+            else:
+                timing_losses.append(
+                    min(abs(float(pred_crossing) - float(true_crossing)), 1.0)
+                )
+        timing_loss = float(np.mean(timing_losses)) if timing_losses else 0.0
 
-        curve_losses.append(0.7 * slope_loss + 0.3 * timing_loss)
+        # Each trajectory contributes one loss, regardless of how many plateau
+        # points it contains, so easy dense curves cannot hide bad slow curves.
+        curve_losses.append(0.5 * slope_loss + 0.5 * timing_loss)
 
     if not curve_losses:
         return 0.0
-    return float(np.mean(curve_losses))
+    mean_loss = float(np.mean(curve_losses))
+    worst_curve_loss = float(np.quantile(curve_losses, 0.9))
+    return float(
+        (1.0 - SHAPE_WORST_CURVE_WEIGHT) * mean_loss
+        + SHAPE_WORST_CURVE_WEIGHT * worst_curve_loss
+    )
 
 
 def _composite_scored_loss(nmse_val: float, shape_loss: float) -> float:
