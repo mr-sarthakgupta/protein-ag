@@ -953,6 +953,15 @@ class Runner:
                 checkpoint_path,
                 label=f"iteration_{iteration}_best",
             )
+        global_best = self._get_best_program()
+        if global_best and (
+            current_iteration_best is None or global_best.id != current_iteration_best.id
+        ):
+            self._save_validation_curve_plot(
+                global_best,
+                checkpoint_path,
+                label=f"iteration_{iteration}_global_best",
+            )
 
         logger.info(f"Checkpoint saved to {checkpoint_path}")
 
@@ -1040,7 +1049,17 @@ class Runner:
         if ode_predictions is None:
             return None
 
-        rhs_text = equation.split("=", 1)[1].strip() if equation.startswith("d(c)/dt") else equation
+        dataset_metrics = (
+            program.metrics.get("per_dataset", {}).get(dataset_name, {})
+            if isinstance(program.metrics, dict)
+            else {}
+        )
+        stored_equation = str(dataset_metrics.get("equation") or equation).strip()
+        rhs_text = (
+            stored_equation.split("=", 1)[1].strip()
+            if stored_equation.startswith("d(c)/dt")
+            else stored_equation
+        )
         feature_names = [f"x{i}" for i in range(X_val.shape[1])]
         expression = equation_session._as_sympy_expr(rhs_text, feature_names)
         feature_symbols = equation_session.feature_symbols(X_val.shape[1])
@@ -1048,6 +1067,9 @@ class Runner:
         y_pred = ode_predictions(rhs_fn, X_val, y_val, np.asarray([], dtype=float))
 
         curve_ids = self._validation_curve_ids(ode_owner, X_val)
+        sample_std = getattr(ode_owner, "_ARRAY_SAMPLE_STD", {}).get(id(X_val))
+        if sample_std is None or sample_std.shape[0] != X_val.shape[0]:
+            sample_std = np.zeros(X_val.shape[0], dtype=float)
         unique_curve_ids = list(dict.fromkeys(np.asarray(curve_ids, dtype=int)))
         panels = []
         for curve_id in unique_curve_ids:
@@ -1061,11 +1083,16 @@ class Runner:
                     "time": X_val[ordered, 0],
                     "true": y_val[ordered],
                     "pred": y_pred[ordered],
+                    "std": sample_std[ordered],
                     "features": X_val[ordered[0], 1:-1],
+                    "rmse": float(
+                        np.sqrt(np.mean((y_pred[ordered] - y_val[ordered]) ** 2))
+                    ),
                 }
             )
         if not panels:
             return None
+        panels.sort(key=lambda panel: panel["rmse"], reverse=True)
 
         base_name = f"{label}_validation_curves"
         title = (
@@ -1116,6 +1143,7 @@ class Runner:
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import numpy as np
 
         n_curves = len(panels)
         n_cols = min(4, max(1, math.ceil(math.sqrt(n_curves))))
@@ -1140,6 +1168,15 @@ class Runner:
                 label="validation points",
                 color="#1f77b4",
             )
+            if np.any(panel["std"] > 0.0):
+                ax.fill_between(
+                    panel["time"],
+                    panel["true"] - panel["std"],
+                    panel["true"] + panel["std"],
+                    alpha=0.16,
+                    color="#1f77b4",
+                    label="replicate ±1 SD",
+                )
             ax.plot(
                 panel["time"],
                 panel["pred"],
@@ -1148,7 +1185,10 @@ class Runner:
                 color="#d62728",
             )
             feature_text = ", ".join(f"x{i + 1}={value:g}" for i, value in enumerate(panel["features"]))
-            ax.set_title(f"curve {panel['curve_id']} | {feature_text}", fontsize=8)
+            ax.set_title(
+                f"curve {panel['curve_id']} | RMSE={panel['rmse']:.4f} | {feature_text}",
+                fontsize=8,
+            )
             ax.grid(True, alpha=0.25)
             if ax_idx % n_cols == 0:
                 ax.set_ylabel("normalized concentration")
@@ -1185,18 +1225,28 @@ class Runner:
         panel_w = 260
         panel_h = 200
         margin = 42
-        title_h = 44
+        title_h = 58
         width = n_cols * panel_w
         height = title_h + n_rows * panel_h
+        all_y_values = []
+        for panel in panels:
+            all_y_values.extend(panel["true"])
+            all_y_values.extend(panel["pred"])
+            all_y_values.extend(panel["true"] - panel["std"])
+            all_y_values.extend(panel["true"] + panel["std"])
+        y_min = float(min(all_y_values))
+        y_max = float(max(all_y_values))
+        y_padding = max(0.02, 0.03 * (y_max - y_min))
+        y_min -= y_padding
+        y_max += y_padding
 
         def scale_points(panel: dict, panel_idx: int, values_key: str) -> str:
             points = []
             xs = panel["time"]
             ys = panel[values_key]
             x_min, x_max = float(min(xs)), float(max(xs))
-            y_min, y_max = 0.0, 1.0
             x_span = x_max - x_min if x_max > x_min else 1.0
-            y_span = y_max - y_min
+            y_span = y_max - y_min if y_max > y_min else 1.0
             col = panel_idx % n_cols
             row = panel_idx // n_cols
             x0 = col * panel_w + margin
@@ -1209,12 +1259,23 @@ class Runner:
                 points.append(f"{px:.2f},{py:.2f}")
             return " ".join(points)
 
+        def scale_band(panel: dict, panel_idx: int) -> str:
+            upper_panel = {**panel, "band": panel["true"] + panel["std"]}
+            lower_panel = {**panel, "band": panel["true"] - panel["std"]}
+            upper = scale_points(upper_panel, panel_idx, "band").split()
+            lower = scale_points(lower_panel, panel_idx, "band").split()
+            return " ".join(upper + list(reversed(lower)))
+
         elements = [
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
             f'viewBox="0 0 {width} {height}">',
             '<rect width="100%" height="100%" fill="white"/>',
             f'<text x="12" y="24" font-family="sans-serif" font-size="14">'
             f"{html.escape(title)}</text>",
+            '<circle cx="14" cy="42" r="3" fill="#1f77b4" fill-opacity="0.65"/>',
+            '<text x="22" y="45" font-family="sans-serif" font-size="9">setting mean ± replicate SD</text>',
+            '<line x1="160" y1="42" x2="180" y2="42" stroke="#d62728" stroke-width="1.8"/>',
+            '<text x="186" y="45" font-family="sans-serif" font-size="9">ODE prediction</text>',
         ]
 
         for idx, panel in enumerate(panels):
@@ -1225,7 +1286,9 @@ class Runner:
             plot_w = panel_w - margin - 16
             plot_h = panel_h - margin - 18
             feature_text = ", ".join(f"x{i + 1}={value:g}" for i, value in enumerate(panel["features"]))
-            panel_title = html.escape(f"curve {panel['curve_id']} | {feature_text}")
+            panel_title = html.escape(
+                f"curve {panel['curve_id']} | RMSE={panel['rmse']:.4f} | {feature_text}"
+            )
             elements.extend(
                 [
                     f'<text x="{col * panel_w + 8}" y="{title_h + row * panel_h + 12}" '
@@ -1236,6 +1299,8 @@ class Runner:
                     f'y2="{y0 + plot_h}" stroke="#777777"/>',
                     f'<line x1="{x0}" y1="{y0}" x2="{x0}" y2="{y0 + plot_h}" '
                     'stroke="#777777"/>',
+                    f'<polygon points="{scale_band(panel, idx)}" fill="#1f77b4" '
+                    'fill-opacity="0.12" stroke="none"/>',
                     f'<polyline points="{scale_points(panel, idx, "pred")}" fill="none" '
                     'stroke="#d62728" stroke-width="1.8"/>',
                     *[
@@ -1245,6 +1310,18 @@ class Runner:
                     ],
                 ]
             )
+            if col == 0:
+                elements.append(
+                    f'<text x="4" y="{y0 + plot_h / 2:.1f}" font-family="sans-serif" '
+                    'font-size="8" transform="rotate(-90 4 '
+                    f'{y0 + plot_h / 2:.1f})">normalized concentration</text>'
+                )
+            if row == n_rows - 1:
+                elements.append(
+                    f'<text x="{x0 + plot_w / 2:.1f}" y="{y0 + plot_h + 14}" '
+                    'font-family="sans-serif" font-size="8" text-anchor="middle">'
+                    "normalized time</text>"
+                )
         elements.append("</svg>")
 
         plot_path = os.path.join(checkpoint_path, f"{base_name}.svg")

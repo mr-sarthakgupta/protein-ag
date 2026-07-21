@@ -544,6 +544,7 @@ class SearchConfig:
     type: str = "topk"
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     num_context_programs: int = 4
+    parallel_agents_per_iteration: int = 1
     output_dir: Optional[str] = None
     switch_interval: Optional[int] = (
         None  # EvoX: stagnation iters before strategy switch. Auto-calculated if None.
@@ -783,6 +784,7 @@ class Config:
             "search": {
                 "type": self.search.type,
                 "num_context_programs": self.search.num_context_programs,
+                "parallel_agents_per_iteration": self.search.parallel_agents_per_iteration,
                 "database": {
                     f.name: getattr(self.search.database, f.name)
                     for f in fields(self.search.database)
@@ -1016,7 +1018,14 @@ def apply_overrides(
         config.search.type = search
         new_db_cls = _DB_CONFIG_BY_TYPE.get(search)
         if new_db_cls and not isinstance(config.search.database, new_db_cls):
-            config.search.database = new_db_cls()
+            previous_database = config.search.database
+            replacement_database = new_db_cls()
+            # Config.from_dict preserves algorithm-specific YAML keys as
+            # attributes even when search.type was omitted. Keep those values
+            # when a CLI --search override selects the concrete database class.
+            for key, value in vars(previous_database).items():
+                setattr(replacement_database, key, value)
+            config.search.database = replacement_database
 
     if system_prompt:
         config.context_builder.system_message = system_prompt

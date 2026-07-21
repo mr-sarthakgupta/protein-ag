@@ -13,6 +13,7 @@ Features:
 - Comprehensive JSON logging of all AdaEvolve signals
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -67,6 +68,11 @@ class AdaEvolveController(DiscoveryController):
         self.enable_retry = getattr(db_config, "enable_error_retry", True)
         self.max_retries = getattr(db_config, "max_error_retries", 2)
         self.num_context_programs = self.config.search.num_context_programs
+        self.parallel_agents_per_iteration = int(
+            getattr(self.config.search, "parallel_agents_per_iteration", 1)
+        )
+        if self.parallel_agents_per_iteration < 1:
+            raise ValueError("search.parallel_agents_per_iteration must be at least 1")
 
         # Components
         self.llms = LLMPool(self.config.llm.models)
@@ -105,7 +111,8 @@ class AdaEvolveController(DiscoveryController):
         logger.info(
             f"AdaEvolveController initialized "
             f"(language={self.config.language}, "
-            f"paradigm_breakthrough={self.database.use_paradigm_breakthrough})"
+            f"paradigm_breakthrough={self.database.use_paradigm_breakthrough}, "
+            f"parallel_agents_per_iteration={self.parallel_agents_per_iteration})"
         )
 
     def _load_evaluator_code(self) -> str:
@@ -158,6 +165,7 @@ class AdaEvolveController(DiscoveryController):
         llm_generation_time: Optional[float] = None,
         eval_time: Optional[float] = None,
         error: Optional[str] = None,
+        agent_results: Optional[List[SerializableResult]] = None,
     ) -> None:
         """
         Log comprehensive iteration statistics to JSON file.
@@ -172,6 +180,7 @@ class AdaEvolveController(DiscoveryController):
             child_program: The child program dict if successfully generated
             iteration_time: Time taken for this iteration
             error: Error message if iteration failed
+            agent_results: Per-agent results for a parallel iteration batch
         """
         if self._iteration_stats_log_path is None:
             return
@@ -216,6 +225,45 @@ class AdaEvolveController(DiscoveryController):
                     "generation": child_program.get("generation"),
                     "parent_id": child_program.get("parent_id"),
                 }
+            if agent_results is not None:
+                serialized_results = []
+                child_programs = []
+                for agent_index, result in enumerate(agent_results):
+                    serialized = {
+                        "agent_index": agent_index,
+                        "success": not bool(result.error),
+                        "error": result.error,
+                        "iteration_time_seconds": result.iteration_time,
+                        "llm_generation_time_seconds": result.llm_generation_time,
+                        "eval_time_seconds": result.eval_time,
+                        "parent_id": result.parent_id,
+                        "sampling_mode": result.sampling_mode,
+                        "sampling_intensity": result.sampling_intensity,
+                    }
+                    if result.child_program_dict:
+                        program = {
+                            "id": result.child_program_dict.get("id"),
+                            "metrics": result.child_program_dict.get("metrics"),
+                            "generation": result.child_program_dict.get("generation"),
+                            "parent_id": result.child_program_dict.get("parent_id"),
+                        }
+                        serialized["child_program"] = program
+                        child_programs.append(program)
+                    serialized_results.append(serialized)
+                stats["iteration_result"]["agent_results"] = serialized_results
+                stats["iteration_result"]["child_programs"] = child_programs
+                if child_programs and "child_program" not in stats["iteration_result"]:
+                    best_id = stats["iteration_result"].get(
+                        "current_iteration_best_program_id"
+                    )
+                    stats["iteration_result"]["child_program"] = next(
+                        (
+                            program
+                            for program in child_programs
+                            if program["id"] == best_id
+                        ),
+                        child_programs[0],
+                    )
 
             # Write to JSONL file
             with open(self._iteration_stats_log_path, "a") as f:
@@ -245,7 +293,8 @@ class AdaEvolveController(DiscoveryController):
         self._run_total_iterations = total
         logger.info(
             f"AdaEvolve: Running {max_iterations} iterations "
-            f"across {self.database.num_islands} islands"
+            f"across {self.database.num_islands} islands with "
+            f"{self.parallel_agents_per_iteration} parallel agent(s) per iteration"
         )
 
         # Set up comprehensive JSON logging for iteration stats
@@ -310,7 +359,7 @@ class AdaEvolveController(DiscoveryController):
                 logger.info(f"Seeded island {i}")
 
     async def _run_iteration(self, iteration: int, checkpoint_callback) -> None:
-        """Execute one evolution iteration."""
+        """Generate one configurable batch of children and commit it atomically."""
         iteration_start_time = time.time()
 
         # Check for global paradigm stagnation
@@ -318,36 +367,77 @@ class AdaEvolveController(DiscoveryController):
         if self.database.use_paradigm_breakthrough and self.database.is_paradigm_stagnating():
             await self._generate_paradigms_if_needed()
 
-        result = await self._run_normal_step(iteration)
+        gathered_results = await asyncio.gather(
+            *(
+                self._run_normal_step(iteration)
+                for _ in range(self.parallel_agents_per_iteration)
+            ),
+            return_exceptions=True,
+        )
+        results: List[SerializableResult] = []
+        for agent_index, gathered_result in enumerate(gathered_results):
+            if isinstance(gathered_result, Exception):
+                logger.error(
+                    "Iteration %s, agent %s raised unexpectedly",
+                    iteration,
+                    agent_index,
+                    exc_info=(
+                        type(gathered_result),
+                        gathered_result,
+                        gathered_result.__traceback__,
+                    ),
+                )
+                results.append(
+                    SerializableResult(
+                        error=f"Unexpected agent failure: {gathered_result}",
+                        iteration=iteration,
+                    )
+                )
+            elif isinstance(gathered_result, BaseException):
+                raise gathered_result
+            else:
+                results.append(gathered_result)
+
+        successful_results = [result for result in results if not result.error]
+        for agent_index, result in enumerate(results):
+            if result.error:
+                logger.warning(
+                    f"Iteration {iteration}, agent {agent_index}: {result.error}"
+                )
+                continue
+            self._process_result(
+                result,
+                iteration,
+                checkpoint_callback=None,
+                checkpoint=False,
+                agent_index=agent_index,
+            )
 
         iteration_time = time.time() - iteration_start_time
+        if successful_results:
+            self._checkpoint_iteration(iteration, checkpoint_callback)
 
-        if result.error:
-            logger.warning(f"Iteration {iteration}: {result.error}")
-            # Log failed iteration stats
-            self._log_iteration_stats(
-                iteration=iteration,
-                sampling_mode=self._last_sampling_mode,
-                sampling_intensity=self._last_sampling_intensity,
-                child_program=None,
-                iteration_time=iteration_time,
-                llm_generation_time=result.llm_generation_time,
-                eval_time=result.eval_time,
-                error=result.error,
-            )
-        else:
-            self._process_result(result, iteration, checkpoint_callback)
-            # Log successful iteration stats
-            self._log_iteration_stats(
-                iteration=iteration,
-                sampling_mode=self._last_sampling_mode,
-                sampling_intensity=self._last_sampling_intensity,
-                child_program=result.child_program_dict,
-                iteration_time=result.iteration_time,
-                llm_generation_time=result.llm_generation_time,
-                eval_time=result.eval_time,
-                error=None,
-            )
+        errors = [result.error for result in results if result.error]
+        batch_error = (
+            f"All {len(results)} parallel agents failed: {'; '.join(errors)}"
+            if not successful_results
+            else None
+        )
+        self._log_iteration_stats(
+            iteration=iteration,
+            sampling_mode=None,
+            sampling_intensity=None,
+            child_program=(
+                successful_results[0].child_program_dict
+                if len(results) == 1 and successful_results
+                else None
+            ),
+            iteration_time=iteration_time,
+            llm_generation_time=sum(result.llm_generation_time for result in results),
+            eval_time=sum(result.eval_time for result in results),
+            error=batch_error,
+            agent_results=results,
+        )
 
     async def _generate_paradigms_if_needed(self) -> None:
         """Generate new paradigms if stagnating and none active."""
@@ -410,6 +500,9 @@ class AdaEvolveController(DiscoveryController):
         result: SerializableResult,
         iteration: int,
         checkpoint_callback,
+        *,
+        checkpoint: bool = True,
+        agent_index: Optional[int] = None,
     ) -> None:
         """Process a successful result by adding to database."""
         child = Program(**result.child_program_dict)
@@ -438,8 +531,9 @@ class AdaEvolveController(DiscoveryController):
             )
 
         # Log progress
+        agent_suffix = f", agent {agent_index}" if agent_index is not None else ""
         logger.info(
-            f"Iteration {iteration}: Program {child.id[:8]} "
+            f"Iteration {iteration}{agent_suffix}: Program {child.id[:8]} "
             f"(parent: {result.parent_id[:8] if result.parent_id else 'None'}) "
             f"completed in {result.iteration_time:.2f}s"
             f" (llm: {result.llm_generation_time:.2f}s,"
@@ -464,7 +558,11 @@ class AdaEvolveController(DiscoveryController):
         elif self.database.best_program_id == child.id:
             logger.info(f"New best solution found at iteration {iteration}")
 
-        # Checkpoint callback
+        if checkpoint:
+            self._checkpoint_iteration(iteration, checkpoint_callback)
+
+    def _checkpoint_iteration(self, iteration: int, checkpoint_callback) -> None:
+        """Save at most one checkpoint after an iteration batch is committed."""
         if iteration > 0 and iteration % self.config.checkpoint_interval == 0:
             logger.info(f"Checkpoint interval reached at iteration {iteration}")
             self.database.log_status()
@@ -516,6 +614,7 @@ class AdaEvolveController(DiscoveryController):
                 )
             else:
                 self._last_sampling_intensity = self.database.fixed_intensity
+            sampling_intensity = self._last_sampling_intensity
 
             # When paradigm is active, use best program as parent
             # This ensures paradigm (designed from best) is applied to best, not random parent
@@ -598,7 +697,7 @@ class AdaEvolveController(DiscoveryController):
                     self.feedback_reader.log_usage(iteration, feedback, self.feedback_reader.mode)
 
             # Generate and evaluate
-            return await self._execute_generation(
+            result = await self._execute_generation(
                 parent,
                 prompt,
                 iteration,
@@ -607,6 +706,9 @@ class AdaEvolveController(DiscoveryController):
                 context_program_ids=context_program_ids,
                 other_context_programs=context_programs_dict,
             )
+            result.sampling_mode = sampling_mode
+            result.sampling_intensity = sampling_intensity
+            return result
 
         except Exception as e:
             logger.exception(f"Generation failed: {e}")

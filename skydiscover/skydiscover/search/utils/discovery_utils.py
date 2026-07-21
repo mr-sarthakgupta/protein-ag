@@ -71,6 +71,8 @@ class SerializableResult:
     iteration: int = 0
     error: Optional[str] = None
     attempts_used: int = 1
+    sampling_mode: Optional[str] = None
+    sampling_intensity: Optional[float] = None
 
 
 def load_database_from_file(

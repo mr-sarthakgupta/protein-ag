@@ -88,6 +88,8 @@ SHAPE_WORST_CURVE_WEIGHT = min(
 )
 SINGLE_EQUATION_ERROR_PREFIX = "Single-equation violation"
 _ARRAY_CURVE_IDS: dict[int, np.ndarray] = {}
+_ARRAY_SAMPLE_WEIGHTS: dict[int, np.ndarray] = {}
+_ARRAY_SAMPLE_STD: dict[int, np.ndarray] = {}
 _ALLOWED_IMPORTS = {"sympy", "numpy"}
 _ALLOWED_FROM_IMPORTS = {
     "__future__",
@@ -459,6 +461,36 @@ def _remember_curve_ids(X: np.ndarray, curve_ids: np.ndarray) -> np.ndarray:
     return X
 
 
+def _remember_sample_uncertainty(
+    X: np.ndarray,
+    sample_weights: np.ndarray,
+    sample_std: np.ndarray | None = None,
+) -> np.ndarray:
+    """Attach pointwise replicate uncertainty metadata to an X array."""
+    weights = np.asarray(sample_weights, dtype=float).reshape(-1)
+    if weights.shape[0] != X.shape[0]:
+        raise ValueError("sample_weights must have one value per X row")
+    _ARRAY_SAMPLE_WEIGHTS[id(X)] = weights
+    if sample_std is not None:
+        std = np.asarray(sample_std, dtype=float).reshape(-1)
+        if std.shape[0] != X.shape[0]:
+            raise ValueError("sample_std must have one value per X row")
+        _ARRAY_SAMPLE_STD[id(X)] = std
+    return X
+
+
+def _sample_weights(X: np.ndarray) -> np.ndarray:
+    """Return normalized point weights, defaulting to equal weighting."""
+    weights = _ARRAY_SAMPLE_WEIGHTS.get(id(X))
+    if weights is None or weights.shape[0] != X.shape[0]:
+        return np.ones(X.shape[0], dtype=float)
+    finite = np.isfinite(weights) & (weights > 0.0)
+    if not np.any(finite):
+        return np.ones(X.shape[0], dtype=float)
+    cleaned = np.where(finite, weights, np.median(weights[finite]))
+    return cleaned / float(np.mean(cleaned))
+
+
 def _minmax_normalize(values: np.ndarray) -> np.ndarray:
     """Normalize one dataset column to 0..1, preserving constants as zeros."""
     values = np.asarray(values, dtype=float)
@@ -582,10 +614,22 @@ def _trajectory_preserving_split(
     fit_idx = np.sort(np.asarray(fit_indices, dtype=int))
     val_idx = np.sort(np.asarray(val_indices, dtype=int))
     curve_ids = _ARRAY_CURVE_IDS.get(id(X), np.zeros(X.shape[0], dtype=int))
+    sample_weights = _sample_weights(X)
+    sample_std = _ARRAY_SAMPLE_STD.get(id(X))
     X_fit = X[fit_idx]
     X_val = X[val_idx]
     _remember_curve_ids(X_fit, curve_ids[fit_idx])
     _remember_curve_ids(X_val, curve_ids[val_idx])
+    _remember_sample_uncertainty(
+        X_fit,
+        sample_weights[fit_idx],
+        sample_std[fit_idx] if sample_std is not None else None,
+    )
+    _remember_sample_uncertainty(
+        X_val,
+        sample_weights[val_idx],
+        sample_std[val_idx] if sample_std is not None else None,
+    )
     return X_fit, X_val, y[fit_idx], y[val_idx]
 
 
@@ -598,6 +642,12 @@ def _evaluation_only_split(
     empty_y = np.empty(0, dtype=float)
     _remember_curve_ids(empty_X, np.empty(0, dtype=int))
     _remember_curve_ids(X, _ARRAY_CURVE_IDS.get(id(X), np.zeros(X.shape[0], dtype=int)))
+    _remember_sample_uncertainty(empty_X, np.empty(0, dtype=float))
+    _remember_sample_uncertainty(
+        X,
+        _sample_weights(X),
+        _ARRAY_SAMPLE_STD.get(id(X)),
+    )
     return empty_X, X, empty_y, y
 
 
@@ -635,7 +685,11 @@ def load_all_datasets(
 
 NUM_WORKERS = int(os.environ.get("SKYDISCOVER_EVAL_WORKERS", min(8, os.cpu_count() or 4)))
 SHAPE_LOSS_WEIGHT = float(os.environ.get("SKYDISCOVER_SHAPE_LOSS_WEIGHT", "0.25"))
-SHAPE_LOSS_WEIGHT = min(max(SHAPE_LOSS_WEIGHT, 0.0), 0.29)
+SHAPE_LOSS_WEIGHT = min(max(SHAPE_LOSS_WEIGHT, 0.0), 1.0)
+SHAPE_FIT_WEIGHT = float(
+    os.environ.get("SKYDISCOVER_SHAPE_FIT_WEIGHT", str(SHAPE_LOSS_WEIGHT))
+)
+SHAPE_FIT_WEIGHT = min(max(SHAPE_FIT_WEIGHT, 0.0), 1.0 - 1e-6)
 
 
 def _gaussian_smooth_1d(values: np.ndarray, sigma: float = GAUSSIAN_SMOOTH_SIGMA) -> np.ndarray:
@@ -670,6 +724,7 @@ def _normalized_mse_with_reference_variance(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     reference_values: np.ndarray,
+    sample_weights: np.ndarray | None = None,
 ) -> float:
     """MSE normalized by full dataset scale, not by a flat validation segment."""
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
@@ -679,10 +734,18 @@ def _normalized_mse_with_reference_variance(
         return float("inf")
     if not np.all(np.isfinite(y_pred)):
         return float("inf")
+    weights = (
+        np.ones(y_true.shape[0], dtype=float)
+        if sample_weights is None
+        else np.asarray(sample_weights, dtype=float).reshape(-1)
+    )
+    if weights.shape != y_true.shape or not np.all(np.isfinite(weights)) or np.any(weights <= 0.0):
+        weights = np.ones(y_true.shape[0], dtype=float)
+    weights = weights / float(np.mean(weights))
     var = float(np.var(reference_values))
     if var <= 0.0:
-        return float(np.mean((y_true - y_pred) ** 2))
-    return float(np.mean((y_true - y_pred) ** 2) / var)
+        return float(np.average((y_true - y_pred) ** 2, weights=weights))
+    return float(np.average((y_true - y_pred) ** 2, weights=weights) / var)
 
 
 def _nmse_with_gaussian_smoothed_target(
@@ -692,7 +755,13 @@ def _nmse_with_gaussian_smoothed_target(
     reference_values: np.ndarray | None = None,
 ) -> float:
     reference = y_true if reference_values is None else reference_values
-    return _normalized_mse_with_reference_variance(y_true, y_pred, reference)
+    weights = _sample_weights(X) if X is not None else None
+    return _normalized_mse_with_reference_variance(
+        y_true,
+        y_pred,
+        reference,
+        sample_weights=weights,
+    )
 
 
 def _bounded_loss(value: float) -> float:
@@ -701,6 +770,22 @@ def _bounded_loss(value: float) -> float:
         return 1.0
     value = max(float(value), 0.0)
     return float(value / (1.0 + value))
+
+
+def _soft_l1_point_residuals(residuals: np.ndarray) -> np.ndarray:
+    """Encode SciPy's soft-L1 cost as residuals for a linear least-squares loss.
+
+    Applying ``loss="soft_l1"`` to the combined point-and-shape vector would
+    suppress the deliberately larger shape residuals as outliers. Transforming
+    only point residuals preserves their robust soft-L1 objective while shape
+    residuals retain their configured quadratic influence.
+    """
+    residuals = np.asarray(residuals, dtype=float)
+    squared = residuals**2
+    magnitude = np.abs(residuals) * np.sqrt(
+        2.0 / (np.sqrt(1.0 + squared) + 1.0)
+    )
+    return np.copysign(magnitude, residuals)
 
 
 def _half_response_time(x: np.ndarray, y: np.ndarray, level: float = 0.5) -> float | None:
@@ -725,21 +810,41 @@ def _half_response_time(x: np.ndarray, y: np.ndarray, level: float = 0.5) -> flo
     return None
 
 
-def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Bounded curve-level shape mismatch with multi-level timing penalties."""
+def _relative_response_levels(y_true: np.ndarray) -> tuple[float, ...]:
+    """Map configured fractions onto a curve's observed baseline-to-plateau range."""
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    if y_true.size == 0:
+        return ()
+    window = min(y_true.size, max(1, int(round(0.05 * y_true.size))))
+    baseline = float(np.median(y_true[:window]))
+    plateau = float(np.median(y_true[-window:]))
+    amplitude = plateau - baseline
+    return tuple(
+        baseline + level * amplitude
+        for level in SHAPE_TIMING_LEVELS
+        if 0.0 < level < 1.0
+    )
+
+
+def _curve_shape_components(
+    X: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> list[tuple[float, tuple[float, ...]]]:
+    """Return bounded slope and timing losses for each complete trajectory."""
     X = np.asarray(X, dtype=float)
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
     if X.shape[0] != y_true.size or y_true.shape != y_pred.shape or y_true.size < 5:
-        return 0.0
+        return []
     if not np.all(np.isfinite(y_pred)):
-        return 1.0
+        return []
 
     curve_ids = _ARRAY_CURVE_IDS.get(id(X))
     if curve_ids is None or curve_ids.shape[0] != X.shape[0]:
         curve_ids = np.zeros(X.shape[0], dtype=int)
 
-    curve_losses: list[float] = []
+    components: list[tuple[float, tuple[float, ...]]] = []
     for curve_id in dict.fromkeys(np.asarray(curve_ids, dtype=int)):
         idx = np.flatnonzero(curve_ids == curve_id)
         if idx.size < 5:
@@ -763,9 +868,9 @@ def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> 
         )
 
         timing_losses: list[float] = []
-        for level in SHAPE_TIMING_LEVELS:
-            if level <= 0.0 or level >= 1.0:
-                continue
+        # Use target-derived levels so every timing fraction remains meaningful
+        # when a seeded trajectory starts above an absolute normalized level.
+        for level in _relative_response_levels(true_curve):
             true_crossing = _half_response_time(x, true_curve, level=level)
             pred_crossing = _half_response_time(x, pred_curve, level=level)
             if true_crossing is None and pred_crossing is None:
@@ -776,11 +881,52 @@ def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> 
                 timing_losses.append(
                     min(abs(float(pred_crossing) - float(true_crossing)), 1.0)
                 )
-        timing_loss = float(np.mean(timing_losses)) if timing_losses else 0.0
+        components.append((slope_loss, tuple(timing_losses)))
+    return components
 
-        # Each trajectory contributes one loss, regardless of how many plateau
-        # points it contains, so easy dense curves cannot hide bad slow curves.
-        curve_losses.append(0.5 * slope_loss + 0.5 * timing_loss)
+
+def _curve_shape_fit_residuals(
+    X: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    point_count: int,
+    shape_weight: float = SHAPE_FIT_WEIGHT,
+) -> np.ndarray:
+    """Encode mean per-curve shape loss as least-squares residuals.
+
+    Every trajectory has equal influence. The scaling makes the residual sum
+    of squares proportional to the existing 50/50 slope/timing shape objective
+    and keeps ``shape_weight`` comparable to the pointwise normalized-MSE term.
+    """
+    components = _curve_shape_components(X, y_true, y_pred)
+    if not components or shape_weight <= 0.0:
+        return np.empty(0, dtype=float)
+
+    objective_odds = shape_weight / max(1.0 - shape_weight, 1e-6)
+    common_scale = max(int(point_count), 1) * objective_odds / len(components)
+    residuals: list[float] = []
+    for slope_loss, timing_losses in components:
+        residuals.append(np.sqrt(max(slope_loss, 0.0) * 0.5 * common_scale))
+        if timing_losses:
+            timing_scale = 0.5 * common_scale / len(timing_losses)
+            residuals.extend(
+                np.sqrt(max(timing_loss, 0.0) * timing_scale)
+                for timing_loss in timing_losses
+            )
+    return np.asarray(residuals, dtype=float)
+
+
+def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Bounded curve-level shape mismatch with multi-level timing penalties."""
+    if not np.all(np.isfinite(np.asarray(y_pred, dtype=float))):
+        return 1.0
+
+    curve_losses = [
+        0.5 * slope_loss
+        + 0.5 * (float(np.mean(timing_losses)) if timing_losses else 0.0)
+        for slope_loss, timing_losses in _curve_shape_components(X, y_true, y_pred)
+    ]
 
     if not curve_losses:
         return 0.0
@@ -932,7 +1078,12 @@ def evaluate_ode_expression(
             "equation_template": f"d(c)/dt = {template}",
             "equation": f"d(c)/dt = {template}",
             "constants": {},
-            "loss": float(np.mean((y_pred_fit - y_fit) ** 2)),
+            "loss": float(
+                np.average(
+                    (y_pred_fit - y_fit) ** 2,
+                    weights=_sample_weights(X_fit),
+                )
+            ),
             "nmse_train": nmse_train,
             "nmse_val": nmse_val,
             "shape_loss_val": shape_loss_val,
@@ -953,15 +1104,32 @@ def evaluate_ode_expression(
     fit_reference = y_train if y_train.size else y_fit
     fit_reference_var = float(np.var(fit_reference)) if fit_reference.size else 0.0
     fit_residual_scale = float(np.sqrt(fit_reference_var)) if fit_reference_var > 0.0 else 1.0
+    fit_sqrt_weights = np.sqrt(_sample_weights(X_fit))
+    shape_residual_count = _curve_shape_fit_residuals(
+        X_fit,
+        y_fit,
+        y_fit,
+        point_count=y_fit.size,
+    ).size
+    failed_residual = np.full(y_fit.size + shape_residual_count, 1e12, dtype=float)
 
     def residual(theta: np.ndarray) -> np.ndarray:
         try:
             prediction = _ode_predictions(rhs_fn, X_fit, y_fit, theta)
         except Exception:
-            return np.full_like(y_fit, 1e12, dtype=float)
+            return failed_residual.copy()
         if prediction.shape != y_fit.shape or not np.all(np.isfinite(prediction)):
-            return np.full_like(y_fit, 1e12, dtype=float)
-        return (prediction - y_fit) / fit_residual_scale
+            return failed_residual.copy()
+        point_residuals = _soft_l1_point_residuals(
+            ((prediction - y_fit) / fit_residual_scale) * fit_sqrt_weights
+        )
+        shape_residuals = _curve_shape_fit_residuals(
+            X_fit,
+            y_fit,
+            prediction,
+            point_count=y_fit.size,
+        )
+        return np.concatenate([point_residuals, shape_residuals])
 
     initial_candidates: list[np.ndarray] = []
     for scale in ODE_MULTISTART_SCALES or (1.0,):
@@ -978,7 +1146,7 @@ def evaluate_ode_expression(
         fit = least_squares(
             residual,
             initial_candidate,
-            loss="soft_l1",
+            loss="linear",
             max_nfev=max_nfev,
         )
         fit_residual = residual(fit.x)
@@ -1032,7 +1200,12 @@ def evaluate_ode_expression(
     scored_loss_val = (
         float("nan") if train_only else _composite_scored_loss(nmse_val, shape_loss_val)
     )
-    loss = float(np.mean((y_pred_fit - y_fit) ** 2))
+    loss = float(
+        np.average(
+            (y_pred_fit - y_fit) ** 2,
+            weights=_sample_weights(X_fit),
+        )
+    )
 
     result = {
         "equation_template": f"d(c)/dt = {template}",

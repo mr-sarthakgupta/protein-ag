@@ -1,0 +1,221 @@
+{
+  "timestamp": "20260719_204423",
+  "available_tools": [
+    "read_file",
+    "search",
+    "web_search",
+    "research_papers",
+    "fetch_webpage",
+    "run_command"
+  ],
+  "external_research_tool_names": [
+    "fetch_webpage",
+    "hf_papers",
+    "research_papers",
+    "web_search"
+  ],
+  "external_research_tools_used": true,
+  "tool_call_count": 6,
+  "tool_calls": [
+    {
+      "step": 0,
+      "tool": "read_file",
+      "args": {
+        "path": "reference/current_adaevolve_run/run_history_summary.json"
+      },
+      "result_len": 86
+    },
+    {
+      "step": 1,
+      "tool": "read_file",
+      "args": {
+        "path": "reference/web_doi_org_10_1074_jbc_m112_375345.txt",
+        "line_start": 1,
+        "line_end": 40
+      },
+      "result_len": 241
+    },
+    {
+      "step": 2,
+      "tool": "run_command",
+      "args": {
+        "command": "python3 -c \"\nimport numpy as np\np='disease_relevant_inhibited_clean/Abeta42/inhibition_constraints/data.tsv'\nwith open(p) as f:\n    hdr=f.readline().rstrip('\\n').split('\\t')\nprint('ncols',len(hdr))\nprint(hdr[:4])\nimport collections\n# count unique cd values from headers\ncds=set()\nfor h in hdr:\n    if 'cd:' in h:\n        seg=h.split('cd:')[1].split('_')[0]\n        cds.add(seg)\nprint('unique cd headers', len(cds))\nprint(sorted(cds)[:10])\n\""
+      },
+      "result_len": 726
+    },
+    {
+      "step": 3,
+      "tool": "run_command",
+      "args": {
+        "command": "python3 -c \"\nimport numpy as np\np='disease_relevant_inhibited_clean/Abeta42/inhibition_constraints/data.tsv'\ndata=np.genfromtxt(p,delimiter='\\t',names=True,dtype=float,encoding=None)\nnames=data.dtype.names\n# take first Y curve and half-time by cd, fix m0,M0\nimport re\ndef parse(h,k):\n    return float(h.split(k+':')[1].split('_')[0])\ninfo={}\nfor i in range(0,len(names),2):\n    xn=names[i]; yn=names[i+1]\n    hdr=xn\n    cd=parse(hdr,'cd'); m0=parse(hdr,'m0'); M0=parse(hdr,'M0')\n    x=data[xn]; y=data[yn]\n    m=np.isfinite(x)&np.isfinite(y)\n    x=x[m]; y=y[m]\n    if len(y)<3: continue\n    yn2=(y-y.min())/(y.max()-y.min()+1e-12)\n    # t50\n    idx=np.argmax(yn2>=0.5)\n    t50=x[idx]/x.max()\n    info.setdefault((M0,m0,cd),[]).append(t50)\nfor k in sorted(info)[:20]:\n    print(k, round(np.mean(info[k]),3), len(info[k]))\n\""
+      },
+      "result_len": 1159
+    },
+    {
+      "step": 4,
+      "tool": "run_command",
+      "args": {
+        "command": "python3 -c \"\nimport numpy as np\np='disease_relevant_inhibited_clean/Abeta42/inhibition_constraints/data.tsv'\nwith open(p) as f:\n    hdr=f.readline().rstrip('\\n').split('\\t')\nraw=np.genfromtxt(p,delimiter='\\t',skip_header=1,dtype=float)\ndef parse(h,k): return float(h.split(k+':')[1].split('_')[0])\ninfo={}\nfor i in range(0,len(hdr),2):\n    h=hdr[i]\n    cd=parse(h,'cd'); m0=parse(h,'m0'); M0=parse(h,'M0')\n    x=raw[:,i]; y=raw[:,i+1]\n    m=np.isfinite(x)&np.isfinite(y)\n    x=x[m]; y=y[m]\n    if len(y)<3: continue\n    yn=(y-y.min())/(y.max()-y.min()+1e-12)\n    idx=np.argmax(yn>=0.5)\n    info.setdefault((M0,m0,cd),[]).append(x[idx]/x.max())\n# group by fixed M0,m0 show t50 vs cd\nkeys=sorted(info)\nseen=set()\nfor (M0,m0,cd) in keys:\n    if (M0,m0) in seen: continue\n    seen.add((M0,m0))\n    print('M0=%g m0=%g'%(M0,m0))\n    for c in sorted(set(k[2] for k in keys if k[0]==M0 and k[1]==m0)):\n        print('   cd=%g t50=%.3f'%(c, np.mean(info[(M0,m0,c)])))\n\""
+      },
+      "result_len": 1875
+    },
+    {
+      "step": 5,
+      "tool": "research_papers",
+      "args": {
+        "operation": "snippet_search",
+        "query": "small molecule inhibitor delays half-time secondary nucleation Abeta42 amyloid rate constant reduction",
+        "limit": 4
+      },
+      "result_len": 2351
+    }
+  ],
+  "conversation": [
+    {
+      "role": "user",
+      "content": "# Current Solution Information\n- Main Metrics: \n- combined_score: 0.8816\n\nMetrics:\n  - equation: d(c)/dt = (0.919252764448504 - x4)*(28946790.0411949*x1*x4**2*(625029.502624625*x2 + 1)/((1763791.75032627*x3 + 1)*(26.9421461151201*x3*x4 + 1)) + 2013708.86554232*x1/(1763791.75032627*x3 + 1))\n  - loss: 0.1343\n  - nmse_train: 0.0711\n  - nmse_val: 0.0823\n  - mean_nmse_val: 0.0823\n  - mean_raw_nmse_val: 0.0823\n  - scored_loss_val: 0.1343\n  - mean_scored_loss_val: 0.1343\n  - shape_loss_val: 0.2904\n  - shape_loss_weight: 0.2500\n  - heldout_curve_nmse: 0.0823\n  - heldout_curve_scored_loss: 0.1343\n  - heldout_curve_shape_loss: 0.2904\n  - eval_only_nmse: nan\n  - eval_only_scored_loss: nan\n  - eval_only_shape_loss: nan\n  - fit_score: 0.8816\n  - eval_time: 25.0065\n  - n_datasets: 1\n  - n_successful: 1\n  - eval_workers: 8\n  - hard_case_feedback: Abeta42/inhibition_constraints scored=0.1343 (nmse=0.08226, shape=0.2904)\n  - validation_semantics_feedback: heldout_curve_scored_loss=0.1343, heldout_curve\n...[72525 chars total]...\nntic_trace_20260719_202354.json\n    agentic_trace_20260719_202541.json\n    agentic_trace_20260719_202759.json\n    agentic_trace_20260719_202926.json\n    agentic_trace_20260719_203059.json\n    agentic_trace_20260719_203211.json\n    agentic_trace_20260719_203456.json\n    agentic_trace_20260719_203653.json\n    agentic_trace_20260719_203852.json\n    agentic_trace_20260719_204027.json\n    agentic_trace_20260719_204240.json\n    web_doi_org_10_1074_jbc_m112_375345.txt\n  README.md\n  requirements.txt\n```"
+    },
+    {
+      "role": "assistant",
+      "content": "The best-scoring approach (0.8846) is Program 3/4 with the saturating secondary nucleation and two-part inhibitor denominator. The current parent (0.8816) uses monomer sequestration + surface-coating. Let me check the run history to avoid repeating tried directions.",
+      "tool_calls": [
+        {
+          "id": "tooluse_6lH295BsRakDuPCKmAwv8o",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\": \"reference/current_adaevolve_run/run_history_summary.json\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "Not found: 'run_history_summary.json'. 'reference/current_adaevolve_run/' contains: []",
+      "tool_call_id": "tooluse_6lH295BsRakDuPCKmAwv8o"
+    },
+    {
+      "role": "user",
+      "content": "[Step 2/50 | 48 turns left | 240min remaining]"
+    },
+    {
+      "role": "assistant",
+      "content": "Empty. Let me look at the best-performing checkpoint program structure. The 0.8846 program (Program 3) is the best. Let me build on that direction with a targeted improvement. The shape loss (0.285-0.29) dominates. Let me do targeted research on inhibitor kinetics timing.",
+      "tool_calls": [
+        {
+          "id": "tooluse_rArg5HmBckKKBUpMiJvb8C",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\": \"reference/web_doi_org_10_1074_jbc_m112_375345.txt\", \"line_start\": 1, \"line_end\": 40}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "reference/web_doi_org_10_1074_jbc_m112_375345.txt (lines 1-4 of 4)\n   1 | # Fetched page: https://doi.org/10.1074/jbc.M112.375345\n   2 | # Content-Type: text/html;charset=UTF-8\n   3 | # Fetched at: 2026-06-01T11:02:46Z\n   4 | # Characters: 0",
+      "tool_call_id": "tooluse_rArg5HmBckKKBUpMiJvb8C"
+    },
+    {
+      "role": "user",
+      "content": "[Step 3/50 | 47 turns left | 240min remaining]"
+    },
+    {
+      "role": "assistant",
+      "content": "Empty. Let me examine the data briefly to understand curve shapes, then form a targeted improvement.",
+      "tool_calls": [
+        {
+          "id": "tooluse_0MfNSbY0GFUqr1yJGnWymL",
+          "type": "function",
+          "function": {
+            "name": "run_command",
+            "arguments": "{\"command\": \"python3 -c \\\"\\nimport numpy as np\\np='disease_relevant_inhibited_clean/Abeta42/inhibition_constraints/data.tsv'\\nwith open(p) as f:\\n    hdr=f.readline().rstrip('\\\\n').split('\\\\t')\\nprint('ncols',len(hdr))\\nprint(hdr[:4])\\nimport collections\\n# count unique cd values from headers\\ncds=set()\\nfor h in hdr:\\n    if 'cd:' in h:\\n        seg=h.split('cd:')[1].split('_')[0]\\n        cds.add(seg)\\nprint('unique cd headers', len(cds))\\nprint(sorted(cds)[:10])\\n\\\"\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "$ python3 -c \"\nimport numpy as np\np='disease_relevant_inhibited_clean/Abeta42/inhibition_constraints/data.tsv'\nwith open(p) as f:\n    hdr=f.readline().rstrip('\\n').split('\\t')\nprint('ncols',len(hdr))\nprint(hdr[:4])\nimport collections\n# count unique cd values from headers\ncds=set()\nfor h in hdr:\n    if 'cd:' in h:\n        seg=h.split('cd:')[1].split('_')[0]\n        cds.add(seg)\nprint('unique cd headers', len(cds))\nprint(sorted(cds)[:10])\n\"\n[mode: exec]\n[exit code: 0]\n\nncols 192\n['M0:1e-6_P0:1e-9_cd:2e-6_m0:3e-6_rep:1 X', 'M0:1e-6_P0:1e-9_cd:2e-6_m0:3e-6_rep:1 Y', 'M0:1e-6_P0:1e-9_cd:2e-6_m0:3e-6_rep:2 X', 'M0:1e-6_P0:1e-9_cd:2e-6_m0:3e-6_rep:2 Y']\nunique cd headers 6\n['0', '1.25e-7', '1e-6', '2.5e-7', '2e-6', '5e-7']\n",
+      "tool_call_id": "tooluse_0MfNSbY0GFUqr1yJGnWymL"
+    },
+    {
+      "role": "user",
+      "content": "[Step 4/50 | 46 turns left | 240min remaining]"
+    },
+    {
+      "role": "assistant",
+      "content": "So cd ranges 0 to 2e-6 (6 levels), m0 and M0 vary too. Let me quickly inspect how curves differ by cd to understand the delay/slowdown pattern.",
+      "tool_calls": [
+        {
+          "id": "tooluse_gvnghF5D0YbelgAkCCb5Ne",
+          "type": "function",
+          "function": {
+            "name": "run_command",
+            "arguments": "{\"command\": \"python3 -c \\\"\\nimport numpy as np\\np='disease_relevant_inhibited_clean/Abeta42/inhibition_constraints/data.tsv'\\ndata=np.genfromtxt(p,delimiter='\\\\t',names=True,dtype=float,encoding=None)\\nnames=data.dtype.names\\n# take first Y curve and half-time by cd, fix m0,M0\\nimport re\\ndef parse(h,k):\\n    return float(h.split(k+':')[1].split('_')[0])\\ninfo={}\\nfor i in range(0,len(names),2):\\n    xn=names[i]; yn=names[i+1]\\n    hdr=xn\\n    cd=parse(hdr,'cd'); m0=parse(hdr,'m0'); M0=parse(hdr,'M0')\\n    x=data[xn]; y=data[yn]\\n    m=np.isfinite(x)&np.isfinite(y)\\n    x=x[m]; y=y[m]\\n    if len(y)<3: continue\\n    yn2=(y-y.min())/(y.max()-y.min()+1e-12)\\n    # t50\\n    idx=np.argmax(yn2>=0.5)\\n    t50=x[idx]/x.max()\\n    info.setdefault((M0,m0,cd),[]).append(t50)\\nfor k in sorted(info)[:20]:\\n    print(k, round(np.mean(info[k]),3), len(info[k]))\\n\\\"\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "$ python3 -c \"\nimport numpy as np\np='disease_relevant_inhibited_clean/Abeta42/inhibition_constraints/data.tsv'\ndata=np.genfromtxt(p,delimiter='\\t',names=True,dtype=float,encoding=None)\nnames=data.dtype.names\n# take first Y curve and half-time by cd, fix m0,M0\nimport re\ndef parse(h,k):\n    return float(h.split(k+':')[1].split('_')[0])\ninfo={}\nfor i in range(0,len(names),2):\n    xn=names[i]; yn=names[i+1]\n    hdr=xn\n    cd=parse(hdr,'cd'); m0=parse(hdr,'m0'); M0=parse(hdr,'M0')\n    x=data[xn]; y=data[yn]\n    m=np.isfinite(x)&np.isfinite(y)\n    x=x[m]; y=y[m]\n    if len(y)<3: continue\n    yn2=(y-y.min())/(y.max()-y.min()+1e-12)\n    # t50\n    idx=np.argmax(yn2>=0.5)\n    t50=x[idx]/x.max()\n    info.setdefault((M0,m0,cd),[]).append(t50)\nfor k in sorted(info)[:20]:\n    print(k, round(np.mean(info[k]),3), len(info[k]))\n\"\n[mode: exec]\n[exit code: 1]\n\n\n[stderr]\nTraceback (most recent call last):\n  File \"<string>\", line 14, in <module>\n    cd=parse(hdr,'cd'); m0=parse(hdr,'m0'); M0=parse(hdr,'M0')\n  File \"<string>\", line 9, in parse\n    return float(h.split(k+':')[1].split('_')[0])\n                 ~~~~~~~~~~~~~~^^^\nIndexError: list index out of range\n",
+      "tool_call_id": "tooluse_gvnghF5D0YbelgAkCCb5Ne"
+    },
+    {
+      "role": "user",
+      "content": "[Step 5/50 | 45 turns left | 240min remaining]"
+    },
+    {
+      "role": "assistant",
+      "content": "genfromtxt sanitizes header names. Let me read headers directly and index columns.",
+      "tool_calls": [
+        {
+          "id": "tooluse_gFG6ugNMYMy1wY2CpXN8qH",
+          "type": "function",
+          "function": {
+            "name": "run_command",
+            "arguments": "{\"command\": \"python3 -c \\\"\\nimport numpy as np\\np='disease_relevant_inhibited_clean/Abeta42/inhibition_constraints/data.tsv'\\nwith open(p) as f:\\n    hdr=f.readline().rstrip('\\\\n').split('\\\\t')\\nraw=np.genfromtxt(p,delimiter='\\\\t',skip_header=1,dtype=float)\\ndef parse(h,k): return float(h.split(k+':')[1].split('_')[0])\\ninfo={}\\nfor i in range(0,len(hdr),2):\\n    h=hdr[i]\\n    cd=parse(h,'cd'); m0=parse(h,'m0'); M0=parse(h,'M0')\\n    x=raw[:,i]; y=raw[:,i+1]\\n    m=np.isfinite(x)&np.isfinite(y)\\n    x=x[m]; y=y[m]\\n    if len(y)<3: continue\\n    yn=(y-y.min())/(y.max()-y.min()+1e-12)\\n    idx=np.argmax(yn>=0.5)\\n    info.setdefault((M0,m0,cd),[]).append(x[idx]/x.max())\\n# group by fixed M0,m0 show t50 vs cd\\nkeys=sorted(info)\\nseen=set()\\nfor (M0,m0,cd) in keys:\\n    if (M0,m0) in seen: continue\\n    seen.add((M0,m0))\\n    print('M0=%g m0=%g'%(M0,m0))\\n    for c in sorted(set(k[2] for k in keys if k[0]==M0 and k[1]==m0)):\\n        print('   cd=%g t50=%.3f'%(c, np.mean(info[(M0,m0,c)])))\\n\\\"\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "$ python3 -c \"\nimport numpy as np\np='disease_relevant_inhibited_clean/Abeta42/inhibition_constraints/data.tsv'\nwith open(p) as f:\n    hdr=f.readline().rstrip('\\n').split('\\t')\nraw=np.genfromtxt(p,delimiter='\\t',skip_header=1,dtype=float)\ndef parse(h,k): return float(h.split(k+':')[1].split('_')[0])\ninfo={}\nfor i in range(0,len(hdr),2):\n    h=hdr[i]\n    cd=parse(h,'cd'); m0=parse(h,'m0'); M0=parse(h,'M0')\n    x=raw[:,i]; y=raw[:,i+1]\n    m=np.isfinite(x)&np.isfinite(y)\n    x=x[m]; y=y[m]\n    if len(y)<3: continue\n    yn=(y-y.min())/(y.max()-y.min()+1e-12)\n    idx=np.argmax(yn>=0.5)\n    info.setdefault((M0,m0,cd),[]).append(x[idx]/x.max())\n# group by fixed M0,m0 show t50 vs cd\nkeys=sorted(info)\nseen=set()\nfor (M0,m0,cd) in keys:\n    if (M0,m0) in seen: continue\n    seen.add((M0,m0))\n    print('M0=%g m0=%g'%(M0,m0))\n    for c in sorted(set(k[2] for k in keys if k[0]==M0 and k[1]==m0)):\n        print('   cd=%g t50=%.3f'%(c, np.mean(info[(M0,m0,c)])))\n\"\n[mode: exec]\n[exit code: 0]\n\nM0=0 m0=7.5e-07\n   cd=0 t50=0.184\nM0=0 m0=1.5e-06\n   cd=0 t50=0.093\nM0=0 m0=3e-06\n   cd=0 t50=0.052\n   cd=1.25e-07 t50=0.086\n   cd=2.5e-07 t50=0.082\n   cd=5e-07 t50=0.101\n   cd=1e-06 t50=0.139\n   cd=2e-06 t50=0.216\nM0=0 m0=6e-06\n   cd=0 t50=0.044\nM0=0 m0=1.2e-05\n   cd=0 t50=0.027\nM0=3e-08 m0=7.5e-07\n   cd=0 t50=0.162\nM0=3e-08 m0=1.5e-06\n   cd=0 t50=0.063\nM0=3e-08 m0=3e-06\n   cd=0 t50=0.028\n   cd=1.25e-07 t50=0.067\n   cd=2.5e-07 t50=0.064\n   cd=5e-07 t50=0.097\n   cd=1e-06 t50=0.122\n   cd=2e-06 t50=0.172\nM0=3e-08 m0=6e-06\n   cd=0 t50=0.019\nM0=3e-08 m0=1.2e-05\n   cd=0 t50=0.011\nM0=1e-06 m0=7.5e-07\n   cd=0 t50=0.039\nM0=1e-06 m0=1.5e-06\n   cd=0 t50=0.021\nM0=1e-06 m0=3e-06\n   cd=0 t50=0.013\n   cd=1.25e-07 t50=0.027\n   cd=2.5e-07 t50=0.030\n   cd=5e-07 t50=0.039\n   cd=1e-06 t50=0.053\n   cd=2e-06 t50=0.064\nM0=1e-06 m0=6e-06\n   cd=0 t50=0.008\nM0=1e-06 m0=1.2e-05\n   cd=0 t50=0.006\n",
+      "tool_call_id": "tooluse_gFG6ugNMYMy1wY2CpXN8qH"
+    },
+    {
+      "role": "user",
+      "content": "[Step 6/50 | 44 turns left | 240min remaining]"
+    },
+    {
+      "role": "assistant",
+      "content": "Very informative. Key observations:\n\n1. **t50 vs cd**: For fixed M0,m0, increasing cd multiplies t50 roughly. At m0=3e-6, M0=0: cd=0\u21920.052, cd=2e-6\u21920.216 \u2014 a ~4x delay. The inhibitor delays the half-time substantially. This is a strong, monotone effect of cd on lag/timing.\n\n2. **t50 vs m0** (cd=0): higher monomer \u2192 earlier onset. m0=7.5e-7\u21920.184, m0=1.2e-5\u21920.027. Roughly t50 \u221d 1/m0-ish (strong dependence, faster than linear? 16x m0 \u2192 ~7x faster t50).\n\n3. **t50 vs M0** (seed): higher seed \u2192 much earlier. M0=0\u21920.052, M0=1e-6\u21920.013 at m0=3e-6.\n\nThe best model (0.8846) uses saturating secondary nucleation with cd delaying onset via a state-independent `c4\u00b2\u00b7cd` term in the denominator. That's the right structure. The delay factor at cd=2e-6 is ~4x, so the inhibitor term must be able to slow the *rate constant* by ~4x, i.e. cd term contributes meaningfully relative to the c\u00b2 denominator baseline.\n\nKey insight: The delay is quite strong and consistent (~4x at high cd). The current best divides secondary nucleation. Let me improve on Program 3 (best, 0.8846) rather than the current parent (0.8816). But the diff must apply to the current parent code.\n\nLet me do one targeted research call on inhibitor kinetics in amyloid then finalize.",
+      "tool_calls": [
+        {
+          "id": "tooluse_8S2wFlOitJLthwfI7J3xcq",
+          "type": "function",
+          "function": {
+            "name": "research_papers",
+            "arguments": "{\"operation\": \"snippet_search\", \"query\": \"small molecule inhibitor delays half-time secondary nucleation Abeta42 amyloid rate constant reduction\", \"limit\": 4}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "# Papers matching 'small molecule inhibitor delays half-time secondary nucleation Abeta42 amyloid rate constant reduction'\nShowing 4 paper(s)\n\n## 1. AceFF: A State-of-the-Art Machine Learning Potential for Small Molecules\n**arxiv_id:** 2601.00581 | **upvotes:** 2\nhttps://huggingface.co/papers/2601.00581\n**GitHub:** https://github.com/torchmd/torchmd-net (478 stars)\n**Summary:** We introduce AceFF, a pre-trained machine learning interatomic potential (MLIP) optimized for small molecule drug discovery. While MLIPs have emerged as efficient alternatives to Density Functional Theory (DFT), generalizability across diverse chemical spaces remains difficult. AceFF addresses this ...\n\n## 2. DrugReasoner: Interpretable Drug Approval Prediction with a\n  Reasoning-augmented Language Model\n**arxiv_id:** 2508.18579 | **upvotes:** 14\nhttps://huggingface.co/papers/2508.18579\n**Keywords:** large language model, LLaMA architecture, group relative policy optimization, molecular descriptors, comparative \n...[2351 chars total]...\n\n## 4. Manifold-Constrained Nucleus-Level Denoising Diffusion Model for Structure-Based Drug Design\n**arxiv_id:** 2409.10584 | **upvotes:** 0\nhttps://huggingface.co/papers/2409.10584\n**Summary:** Artificial intelligence models have shown great potential in structure-based drug design, generating ligands with high binding affinities. However, existing models have often overlooked a crucial physical constraint: atoms must maintain a minimum pairwise distance to avoid separation violation, a ph...\n",
+      "tool_call_id": "tooluse_8S2wFlOitJLthwfI7J3xcq"
+    },
+    {
+      "role": "user",
+      "content": "[Step 7/50 | 43 turns left | 239min remaining]"
+    },
+    {
+      "role": "assistant",
+      "content": "Not directly relevant. From the Cohen/Meisl/Knowles/Habchi literature (which I know), small-molecule inhibitors like bexarotene delay onset by suppressing primary nucleation, while others (like DesAbs/brichos) suppress secondary nucleation. The key structural principle: the inhibitor multiplies the effective rate constant of a specific microscopic channel. Data shows a monotone ~4x delay across cd, and both onset (lag) and slope are affected.\n\nI'll build on the winning 0.8846 structure but make a targeted improvement. The best model's shape loss was 0.2851. The key limitation: it uses `c4\u00b2\u00b7cd + c5\u00b2\u00b7cd\u00b7c` inside the denominator alongside `c\u00b2`. That worked well. My improvement will refine the parent toward that winning structure but with a cleaner, well-conditioned inhibitor delay that captures the strong ~4x timing effect, plus keeping the seed acceleration.\n\nThe current parent already has monomer sequestration (m_eff) which affects plateau \u2014 but data shows plateau is roughly cd-indepen\n...[6931 chars total]...\nch contradicts the data showing cd-independent plateaus) and adopts the proven-best saturating secondary-nucleation family with a two-part inhibitor denominator. The initializer favors a stronger onset-delay coefficient (c4=1.5) to better capture the observed ~4x half-time stretch at high cd \u2014 the dominant worst-curve shape failure. This is a disciplined exploitation of the best-scoring direction with a targeted initializer change addressing the strong monotone lag effect I measured in the data."
+    }
+  ]
+}

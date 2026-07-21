@@ -34,33 +34,40 @@ prompt:
     experimental curve, and each paired header is named with:
       M0:<seed concentration>_P0:<seed number>_cd:<initial inhibitor concentration>_m0:<initial monomer>
 
-    please note that for the current run, there is only a single dataset with 192 curves corresponding to a single protein only, so proceed accordingly
+    For the current run there is one protein dataset with 96 raw replicate
+    trajectories representing 30 unique experimental settings. The evaluator
+    averages replicates sharing (m0, M0, P0, cd) before fitting and scoring.
+    `SKYDISCOVER_INCLUDE_UNINHIBITED=0` filters out the 15 cd=0 settings,
+    leaving only the 15 positive-inhibitor settings exposed to the search.
 
     The evaluator normalizes every dataset before fitting:
     - x0 = min-max normalized measurement time coordinate (the X)
-    - x1 = m0 initial monomer concentration, parsed as the leading number
-      from the header while ignoring units
-    - x2 = M0 seed concentration, parsed as the leading number from the
-      header while ignoring units
-    - x3 = cd initial inhibitor concentration, parsed as the leading number
-      from the header while ignoring units. This is a static per-curve
-      concentration, not a dynamic ODE state.
+    - x1 = m0 initial monomer concentration in micromolar units (raw / 1e-6)
+    - x2 = M0 seed concentration in micromolar units (raw / 1e-6)
+    - x3 = cd initial inhibitor concentration in micromolar units (raw / 1e-6).
+      This is a static per-setting concentration, not a dynamic ODE state.
     - x4 = current normalized concentration/state c supplied by ODE integration (the Y)
     - y  = response/concentration min-max normalized globally across the
-      whole data.tsv response table
+      settings exposed by the current uninhibited-data flag
 
-    The source file contains one shared `time` column followed by replicate
-    response columns with repeated metadata headers. The cleaned data expands
-    those into adjacent X/Y pairs so each replicate is one trajectory.
+    The source file contains replicate response columns with repeated metadata
+    headers. The evaluator aligns and averages those replicates in raw response
+    space, retains their pointwise uncertainty for weighted fitting, and emits
+    one trajectory per unique experimental setting.
 
     Many source files are already response-rescaled to 0→1. The evaluator uses
     the same global per-dataset min-max normalization, so those files remain on
     the same scale while unnormalized files are brought to the same range.
 
     Splits separate constant fitting from NMSE evaluation:
-    - datasets with 6 or more curves hold out whole X/Y curves for
-      validation; remaining curves stay entirely in the train split;
-    - datasets with fewer than 6 curves use all points for constant
+    - the 30-setting inhibitor design holds out 10 whole replicate-averaged
+      settings: 5 inhibited and 5 uninhibited curves, covering every inhibitor
+      dose and monomer level once and distributing validation 4/3/3 across the
+      three seed conditions; the remaining 20 settings stay entirely in train;
+    - when cd=0 settings are disabled, the 15-setting inhibitor-only design
+      holds out 5 curves, covering every positive inhibitor dose once across
+      all seed conditions; the remaining 10 settings stay entirely in train;
+    - datasets with fewer than 6 settings use all points for constant
       fitting only and do not contribute validation NMSE to the aggregate score;
     - this inhibitor benchmark currently has no designated cross-protein
       evaluation-only datasets, so all validation points come from held-out
@@ -97,10 +104,13 @@ prompt:
             (1 - shape_loss_weight) * dataset_nmse
             + shape_loss_weight * dataset_shape_loss
 
-    where `shape_loss_weight` defaults to 0.25 and is capped below 0.30. The
-    shape loss is curve-level: each held-out trajectory contributes one shape
-    loss regardless of how many plateau points it contains. It compares slope
-    profile plus response-crossing timing at 10%, 25%, 50%, 75%, and 90%.
+    where `shape_loss_weight` defaults to 0.25 and may be configured anywhere
+    from 0 to 1. The shape loss is curve-level: each held-out trajectory
+    contributes one shape loss regardless of how many plateau points it
+    contains. It compares slope profile plus response-crossing timing at 10%,
+    25%, 50%, 75%, and 90%. The same shape objective is included while fitting
+    constants, with an independently configurable `SKYDISCOVER_SHAPE_FIT_WEIGHT`
+    that defaults to `shape_loss_weight`.
     The final shape loss blends the mean curve loss with a high-quantile
     worst-curve term, so a few visibly wrong delayed or slow inhibitor curves
     cannot be hidden by many easy saturating trajectories.
@@ -255,6 +265,12 @@ prompt:
     Every extra operation or fitted constant should have a clear expected payoff
     in validation fit or robustness.
 
+    The initial population intentionally spans substantially different kinetic
+    families. Do not preserve a parent's capacity-limited or autonomous form
+    merely because it is already present. When shape fit stagnates, consider
+    signed removal fluxes, transient time forcing, moving equilibria, reversible
+    kinetics, saturation, cooperative state gates, or asymmetric growth laws.
+
     Keep in mind concepts like conservation of mass, conservation of energy, etc, the equations should be physically meaningful. Also think about how inhibition might actually happen at a molecular level
 
     In general, good candidates are:
@@ -300,7 +316,9 @@ prompt:
       autocatalytic growth, plateau, or timing without losing the cd=0 behavior.
 
 search:
+  type: adaevolve
   share_llm: true
+  parallel_agents_per_iteration: 4
   database:
     num_islands: 4
     pareto_objectives:

@@ -1,5 +1,5 @@
 # EVOLVE-BLOCK-START
-"""Diverse inhibited ODE seed for normalized Abeta42 aggregation kinetics."""
+"""Structurally diverse inhibited ODE seed: monomer_sequestration."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ def evaluate_symbolic_candidate(
     X_val: NDArray,
     y_val: NDArray,
 ) -> dict[str, Any]:
-    """Single-equation inhibited aggregation ODE seed."""
+    """Explore the monomer sequestration kinetic family."""
     x = feature_symbols(X_train.shape[1])
-    c = constant_symbols(8)
+    c = constant_symbols(9)
 
     time = x[0]
     monomer = x[1]
@@ -31,12 +31,11 @@ def evaluate_symbolic_candidate(
     inhibitor = x[3]
     concentration = x[4]
 
-    plateau = c[0]
-    capacity = plateau - concentration
-    free_monomer = monomer / (1 + c[1] ** 2 * inhibitor + c[2] ** 2 * inhibitor * monomer)
-    source = c[3] ** 2 + c[4] ** 2 * free_monomer + c[5] ** 2 * seed
-    secondary = c[6] ** 2 * free_monomer * concentration * (1 + concentration)
-    expression = capacity * (source + secondary) + c[7] * time * capacity
+    bound_monomer = monomer * inhibitor / (c[0] ** 2 + inhibitor + c[1] ** 2)
+    free_monomer = monomer / (1 + c[2] ** 2 * bound_monomer)
+    source = c[3] ** 2 * free_monomer + c[4] ** 2 * seed
+    secondary = c[5] ** 2 * free_monomer * concentration
+    expression = (c[6] - concentration) * (source + secondary) - c[7] ** 2 * bound_monomer * concentration / (1 + c[8] ** 2 * concentration)
 
     return evaluate_expression(
         expression,
@@ -45,7 +44,7 @@ def evaluate_symbolic_candidate(
         X_val,
         y_val,
         constants=c,
-        initial_values=[1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        initial_values=[0.7, 0.5, 1.0, 1.0, 0.5, 1.0, 1.0, 0.5, 1.0],
     )
 
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── Configuration (override via environment) ─────────────────────────
-MAX_COST="${MAX_COST:-45}"
+MAX_COST="${MAX_COST:-75}"
 ITERATIONS="${ITERATIONS:-100}"
 SEARCH="${SEARCH:-adaevolve}"  # supported: adaevolve, evox
 ALLOW_SMOKE_FAIL="${ALLOW_SMOKE_FAIL:-0}"
@@ -13,8 +13,45 @@ SKYDISCOVER_SEED_INGESTION_CONCURRENCY="${SKYDISCOVER_SEED_INGESTION_CONCURRENCY
 SKYDISCOVER_SEED_CURVE_WORKERS="${SKYDISCOVER_SEED_CURVE_WORKERS:-1}"
 SKYDISCOVER_SEED_MULTISTART_WORKERS="${SKYDISCOVER_SEED_MULTISTART_WORKERS:-1}"
 SKYDISCOVER_SEED_FAST_MAX_NFEV="${SKYDISCOVER_SEED_FAST_MAX_NFEV:-120}"
-SKYDISCOVER_SEED_TOP_K="${SKYDISCOVER_SEED_TOP_K:-24}"
+SKYDISCOVER_SEED_TOP_K="${SKYDISCOVER_SEED_TOP_K:-all}"
 SKYDISCOVER_SEED_DEDUPLICATE="${SKYDISCOVER_SEED_DEDUPLICATE:-1}"
+# Exclude cd=0 controls by default for the temporary inhibitor-only run.
+SKYDISCOVER_INCLUDE_UNINHIBITED="${SKYDISCOVER_INCLUDE_UNINHIBITED:-0}"
+
+for arg in "$@"; do
+    case "$arg" in
+        --include-uninhibited)
+            SKYDISCOVER_INCLUDE_UNINHIBITED=1
+            ;;
+        --exclude-uninhibited)
+            SKYDISCOVER_INCLUDE_UNINHIBITED=0
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--include-uninhibited|--exclude-uninhibited]"
+            echo "Default: --exclude-uninhibited"
+            exit 0
+            ;;
+        *)
+            echo "ERROR: Unknown argument: $arg" >&2
+            echo "Usage: $0 [--include-uninhibited|--exclude-uninhibited]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+case "$SKYDISCOVER_INCLUDE_UNINHIBITED" in
+    1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+        SKYDISCOVER_INCLUDE_UNINHIBITED=1
+        ;;
+    0|false|FALSE|False|no|NO|No|off|OFF|Off)
+        SKYDISCOVER_INCLUDE_UNINHIBITED=0
+        ;;
+    *)
+        echo "ERROR: SKYDISCOVER_INCLUDE_UNINHIBITED must be a boolean value" >&2
+        exit 2
+        ;;
+esac
+
 export SKYDISCOVER_INHIBITED_MAX_NFEV
 export SKYDISCOVER_ODE_CURVE_WORKERS
 export SKYDISCOVER_ODE_MULTISTART_WORKERS
@@ -24,6 +61,7 @@ export SKYDISCOVER_SEED_MULTISTART_WORKERS
 export SKYDISCOVER_SEED_FAST_MAX_NFEV
 export SKYDISCOVER_SEED_TOP_K
 export SKYDISCOVER_SEED_DEDUPLICATE
+export SKYDISCOVER_INCLUDE_UNINHIBITED
 # Keep Bedrock calls pinned to the repo-standard region.
 AWS_REGION="us-east-1"
 export AWS_REGION
@@ -35,13 +73,17 @@ export BEDROCK_READ_TIMEOUT="${BEDROCK_READ_TIMEOUT:-1800}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCHMARK_DIR="benchmarks/pysr_symbolic/disease_relevant_inhibited_all_normalized_ode"
 BENCHMARK_ROOT="$SCRIPT_DIR/benchmarks/pysr_symbolic"
-SKYDISCOVER_SEED_CHECKPOINT="${SKYDISCOVER_SEED_CHECKPOINT:-$SCRIPT_DIR/outputs_diff_inhibited_norm/$SEARCH/seed_checkpoints/disease_relevant_inhibited_all_normalized_ode_nfev${SKYDISCOVER_INHIBITED_MAX_NFEV}_curve${SKYDISCOVER_ODE_CURVE_WORKERS}_multistart${SKYDISCOVER_ODE_MULTISTART_WORKERS}}"
+SKYDISCOVER_SEED_CHECKPOINT="${SKYDISCOVER_SEED_CHECKPOINT:-$SCRIPT_DIR/outputs_diff_inhibited_norm/$SEARCH/seed_checkpoints/disease_relevant_inhibited_all_normalized_ode_nfev${SKYDISCOVER_INHIBITED_MAX_NFEV}_curve${SKYDISCOVER_ODE_CURVE_WORKERS}_multistart${SKYDISCOVER_ODE_MULTISTART_WORKERS}_uninhibited${SKYDISCOVER_INCLUDE_UNINHIBITED}}"
 export SKYDISCOVER_SEED_CHECKPOINT
 
 # ── Preflight checks ────────────────────────────────────────────────
 echo "╔════════════════════════════════════════════════════════════════════╗"
 echo "║  Abeta42 Inhibitor — Normalized ODE Discovery                     ║"
-echo "║  1 dataset · 96 trajectories · shared differential equation       ║"
+if [ "$SKYDISCOVER_INCLUDE_UNINHIBITED" = "1" ]; then
+    echo "║  1 dataset · 30 settings (including cd=0) · shared ODE            ║"
+else
+    echo "║  1 dataset · 15 inhibited settings (cd>0 only) · shared ODE       ║"
+fi
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo ""
 echo "  Search algorithm : $SEARCH"
@@ -59,6 +101,7 @@ echo "  Seed multistart workers: $SKYDISCOVER_SEED_MULTISTART_WORKERS"
 echo "  Seed fast nfev   : $SKYDISCOVER_SEED_FAST_MAX_NFEV"
 echo "  Seed top-k       : $SKYDISCOVER_SEED_TOP_K"
 echo "  Seed dedupe      : $SKYDISCOVER_SEED_DEDUPLICATE"
+echo "  Include cd=0     : $SKYDISCOVER_INCLUDE_UNINHIBITED"
 echo "  Seed checkpoint  : $SKYDISCOVER_SEED_CHECKPOINT"
 echo ""
 
