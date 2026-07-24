@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import configparser
 import logging
 import os
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from skydiscover.config import LLMModelConfig
 from skydiscover.llm.base import LLMInterface, LLMResponse
+from skydiscover.llm.bedrock_auth import (
+    bedrock_api_key_from_aws_credentials as _bedrock_api_key_from_aws_credentials,
+)
+from skydiscover.llm.bedrock_auth import (
+    ensure_bedrock_bearer_token as _ensure_bedrock_bearer_token,
+)
 
 logger = logging.getLogger("skydiscover.llm")
 
@@ -58,49 +62,6 @@ def _prompt_cache_point() -> Optional[Dict[str, Any]]:
     if raw:
         cache_point["ttl"] = raw
     return {"cachePoint": cache_point}
-
-
-def _bedrock_api_key_from_aws_credentials(
-    profile: Optional[str] = None,
-    credentials_path: Optional[Path] = None,
-) -> Optional[str]:
-    """Return a Bedrock API key stored in aws_session_token, if present.
-
-    Bedrock bearer API keys use an ABSK prefix. They are not AWS STS session
-    tokens, but users sometimes place them in ~/.aws/credentials under
-    aws_session_token because both are token-like values.
-    """
-    credentials_path = credentials_path or Path(
-        os.environ.get("AWS_SHARED_CREDENTIALS_FILE", Path.home() / ".aws" / "credentials")
-    )
-    if not credentials_path.exists():
-        return None
-
-    parser = configparser.RawConfigParser()
-    parser.read(credentials_path)
-    section = profile or os.environ.get("AWS_PROFILE") or "default"
-    if not parser.has_section(section):
-        return None
-
-    token = parser.get(section, "aws_session_token", fallback="").strip()
-    if token.startswith("ABSK"):
-        return token
-    return None
-
-
-def _ensure_bedrock_bearer_token(profile: Optional[str] = None) -> bool:
-    if os.environ.get("AWS_BEARER_TOKEN_BEDROCK"):
-        return False
-
-    token = _bedrock_api_key_from_aws_credentials(profile)
-    if not token:
-        return False
-
-    os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
-    logger.info(
-        "Using Bedrock API key from aws_session_token as AWS_BEARER_TOKEN_BEDROCK"
-    )
-    return True
 
 
 class BedrockLLM(LLMInterface):
@@ -188,9 +149,7 @@ class BedrockLLM(LLMInterface):
                     raise
             except Exception as exc:
                 if attempt < retries:
-                    logger.warning(
-                        f"Error attempt {attempt + 1}/{retries + 1}: {exc}, retrying..."
-                    )
+                    logger.warning(f"Error attempt {attempt + 1}/{retries + 1}: {exc}, retrying...")
                     await asyncio.sleep(retry_delay)
                 else:
                     raise
@@ -265,9 +224,7 @@ class BedrockLLM(LLMInterface):
     def _extract_text(self, response: Dict[str, Any]) -> str:
         content = response.get("output", {}).get("message", {}).get("content", [])
         parts = [
-            item.get("text", "")
-            for item in content
-            if isinstance(item, dict) and item.get("text")
+            item.get("text", "") for item in content if isinstance(item, dict) and item.get("text")
         ]
         return "\n".join(parts)
 

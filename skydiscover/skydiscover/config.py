@@ -15,6 +15,8 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+BEDROCK_MANTLE_API_BASE = "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Internal — provider resolution helpers
@@ -35,6 +37,10 @@ _PROVIDERS: Dict[str, tuple] = {
         "bedrock",
         ["AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID"],
     ),
+    "bedrock-mantle": (
+        BEDROCK_MANTLE_API_BASE,
+        ["AWS_BEARER_TOKEN_BEDROCK"],
+    ),
     "huggingface": (None, ["HF_TOKEN", "HUGGINGFACE_API_KEY"]),
     "ollama": (None, []),
     "vllm": (None, []),
@@ -42,6 +48,7 @@ _PROVIDERS: Dict[str, tuple] = {
 
 # Bare model-name prefixes → provider  (backwards compat for --model gpt-5, etc.)
 _BARE_PREFIX_MAP: Dict[str, str] = {
+    "openai.gpt-": "bedrock-mantle",
     "gpt-": "openai",
     "o1": "openai",
     "o3": "openai",
@@ -91,6 +98,10 @@ def _resolve_api_key_from_env(env_vars: Optional[List[str]] = None) -> Optional[
         key = os.environ.get(var)
         if key:
             return key
+    if env_vars == _PROVIDERS["bedrock-mantle"][1]:
+        from skydiscover.llm.bedrock_auth import resolve_bedrock_bearer_token
+
+        return resolve_bedrock_bearer_token()
     if env_vars == _PROVIDERS["bedrock"][1]:
         return None
     return os.environ.get("OPENAI_API_KEY")
@@ -322,6 +333,22 @@ class AgenticConfig:
     run_command_default_timeout: int = 100
     run_command_max_timeout: int = 300
     run_command_max_output_chars: int = 20_000
+
+
+@dataclass
+class IterationExplanationConfig:
+    """Optional direct-LLM explanations at completed AdaEvolve batch boundaries."""
+
+    enabled: bool = False
+    models: List[LLMModelConfig] = field(default_factory=list)
+    max_tokens: int = 8000
+    timeout: int = 300
+    retries: int = 0
+    system_message: str = (
+        "You are a careful mathematical and scientific interpreter. "
+        "Return strict JSON and distinguish evidence from hypotheses."
+    )
+    observed_variables: Dict[str, str] = field(default_factory=dict)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -624,6 +651,9 @@ class Config:
     search: SearchConfig = field(default_factory=SearchConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
     agentic: AgenticConfig = field(default_factory=AgenticConfig)
+    iteration_explanations: IterationExplanationConfig = field(
+        default_factory=IterationExplanationConfig
+    )
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
 
     # Live monitor dashboard
@@ -695,6 +725,7 @@ class Config:
                 "search",
                 "evaluator",
                 "agentic",
+                "iteration_explanations",
                 "benchmark",
                 "monitor",
             ] and hasattr(config, key):
@@ -743,6 +774,13 @@ class Config:
                 if tuple_field in agentic_dict and isinstance(agentic_dict[tuple_field], list):
                     agentic_dict[tuple_field] = tuple(agentic_dict[tuple_field])
             config.agentic = AgenticConfig(**agentic_dict)
+        if "iteration_explanations" in config_dict:
+            explanation_dict = dict(config_dict["iteration_explanations"])
+            if "models" in explanation_dict:
+                explanation_dict["models"] = [
+                    LLMModelConfig(**model) for model in explanation_dict["models"]
+                ]
+            config.iteration_explanations = IterationExplanationConfig(**explanation_dict)
         if "benchmark" in config_dict:
             benchmark_dict = config_dict["benchmark"]
             # Separate known dataclass fields from benchmark-specific parameters
@@ -822,6 +860,15 @@ class Config:
                 "run_command_default_timeout": self.agentic.run_command_default_timeout,
                 "run_command_max_timeout": self.agentic.run_command_max_timeout,
                 "run_command_max_output_chars": self.agentic.run_command_max_output_chars,
+            },
+            "iteration_explanations": {
+                "enabled": self.iteration_explanations.enabled,
+                "models": self.iteration_explanations.models,
+                "max_tokens": self.iteration_explanations.max_tokens,
+                "timeout": self.iteration_explanations.timeout,
+                "retries": self.iteration_explanations.retries,
+                "system_message": self.iteration_explanations.system_message,
+                "observed_variables": self.iteration_explanations.observed_variables,
             },
             # Live monitor
             "monitor": {

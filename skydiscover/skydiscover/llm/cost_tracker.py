@@ -23,10 +23,22 @@ _BEDROCK_SONNET_46_PRICING = {
     "cache_read": 0.30 / 1_000_000,
 }
 
+# GPT-5.6 Sol through Amazon Bedrock Mantle (US East, standard tier).
+# Mantle currently exposes one 30-minute cache-write rate, so both legacy
+# cache-duration keys intentionally use the same published price.
+_BEDROCK_GPT_56_SOL_PRICING = {
+    "input": 5.50 / 1_000_000,
+    "output": 33.00 / 1_000_000,
+    "cache_write_5m": 6.88 / 1_000_000,
+    "cache_write_1h": 6.88 / 1_000_000,
+    "cache_read": 0.55 / 1_000_000,
+}
+
 # Fallback for unknown models — same as Sonnet 4.6 to be conservative
 _DEFAULT_PRICING = _BEDROCK_SONNET_46_PRICING
 
 _MODEL_PRICING: dict[str, dict[str, float]] = {
+    "openai.gpt-5.6-sol": _BEDROCK_GPT_56_SOL_PRICING,
     "us.anthropic.claude-sonnet-4-6": _BEDROCK_SONNET_46_PRICING,
     "anthropic.claude-sonnet-4-6": _BEDROCK_SONNET_46_PRICING,
     "us.anthropic.claude-sonnet-4-5-v2": _BEDROCK_SONNET_46_PRICING,
@@ -92,8 +104,7 @@ class CostTracker:
             snapshot_calls = self.total_calls
 
         logger.info(
-            "LLM call #%d: in=%d out=%d cache_r=%d cache_w=%d "
-            "call=$%.4f total=$%.4f / $%.2f",
+            "LLM call #%d: in=%d out=%d cache_r=%d cache_w=%d " "call=$%.4f total=$%.4f / $%.2f",
             snapshot_calls,
             input_tokens,
             output_tokens,

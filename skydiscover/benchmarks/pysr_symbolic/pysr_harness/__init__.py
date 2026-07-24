@@ -1,12 +1,17 @@
 """Shared PySR-backed symbolic regression utilities for SkyDiscover benchmarks."""
 
 from pysr_harness.equation_session import (
+    CandidateEquation,
+    algebraic_equation,
     constant_symbols,
+    evaluate_equation_system,
     evaluate_expression,
     feature_symbols,
     fit_expression_constants,
+    ode_equation,
     pysr_operator_names,
     pysr_operator_namespace,
+    resolve_equation_system,
 )
 from pysr_harness.metrics import combined_score_from_nmse, nmse
 from pysr_harness.operators import (
@@ -19,6 +24,11 @@ from pysr_harness.operators import (
 __all__ = [
     "feature_symbols",
     "constant_symbols",
+    "CandidateEquation",
+    "ode_equation",
+    "algebraic_equation",
+    "resolve_equation_system",
+    "evaluate_equation_system",
     "fit_expression_constants",
     "evaluate_expression",
     "pysr_operator_names",

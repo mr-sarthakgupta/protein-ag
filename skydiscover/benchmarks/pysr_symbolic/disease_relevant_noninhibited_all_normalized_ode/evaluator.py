@@ -98,14 +98,23 @@ _ALLOWED_FROM_IMPORTS = {
     "pysr_harness.equation_session",
 }
 _ALLOWED_HARNESS_IMPORTS = {
+    "CandidateEquation",
+    "algebraic_equation",
     "constant_symbols",
+    "evaluate_equation_system",
     "evaluate_expression",
     "feature_symbols",
+    "ode_equation",
 }
 _ALLOWED_EVALUATE_CALLS = {
+    "CandidateEquation",
+    "algebraic_equation",
     "constant_symbols",
+    "evaluate_equation_system",
     "evaluate_expression",
     "feature_symbols",
+    "ode_equation",
+    "sp.Symbol",
     "sp.exp",
     "sp.log",
     "sp.log1p",
@@ -118,9 +127,13 @@ _ALLOWED_EVALUATE_CALLS = {
     "sp.cosh",
 }
 _PROTECTED_NAMES = {
+    "CandidateEquation",
+    "algebraic_equation",
     "constant_symbols",
+    "evaluate_equation_system",
     "evaluate_expression",
     "feature_symbols",
+    "ode_equation",
     "single_equation_evaluation",
     "validate_single_equation_result",
 }
@@ -257,10 +270,11 @@ def _validate_plain_import(alias: ast.alias) -> None:
 
 def _validate_evaluate_expression_data_args(call: ast.Call) -> set[int]:
     expected = ["X_train", "y_train", "X_val", "y_val"]
+    scorer_name = _call_name(call.func)
     if len(call.args) < 5:
         raise ValueError(
-            f"{SINGLE_EQUATION_ERROR_PREFIX}: evaluate_expression() must be called "
-            "as evaluate_expression(expression, X_train, y_train, X_val, y_val, ...)."
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: {scorer_name}() must be called with "
+            "a candidate followed by X_train, y_train, X_val, and y_val."
         )
     actual_data_args = call.args[1:5]
     if not all(
@@ -268,7 +282,7 @@ def _validate_evaluate_expression_data_args(call: ast.Call) -> set[int]:
         for arg, expected_name in zip(actual_data_args, expected)
     ):
         raise ValueError(
-            f"{SINGLE_EQUATION_ERROR_PREFIX}: evaluate_expression() must use the "
+            f"{SINGLE_EQUATION_ERROR_PREFIX}: {scorer_name}() must use the "
             "canonical data arguments exactly as X_train, y_train, X_val, y_val. "
             "Do not fit constants on validation labels or reorder the split."
         )
@@ -355,8 +369,8 @@ def validate_candidate_source(program_path: str) -> None:
                 if extra:
                     raise ValueError(
                         f"{SINGLE_EQUATION_ERROR_PREFIX}: unsupported harness imports "
-                        f"{sorted(extra)}. Use only feature_symbols, constant_symbols, "
-                        "and evaluate_expression."
+                        f"{sorted(extra)}. Use only the supported equation-system "
+                        "constructors, symbol helpers, and scorer."
                     )
         else:
             raise ValueError(
@@ -387,14 +401,20 @@ def validate_candidate_source(program_path: str) -> None:
     if not (
         isinstance(return_value, ast.Call)
         and isinstance(return_value.func, ast.Name)
-        and return_value.func.id == "evaluate_expression"
+        and return_value.func.id in {"evaluate_expression", "evaluate_equation_system"}
     ):
         raise ValueError(
             f"{SINGLE_EQUATION_ERROR_PREFIX}: evaluate_symbolic_candidate() must directly "
-            "return evaluate_expression(...), with no wrapper or post-processing."
+            "return evaluate_expression(...) or evaluate_equation_system(...), "
+            "with no wrapper or post-processing."
         )
-    allowed_data_arg_ids = _validate_evaluate_expression_data_args(return_value)
-    allowed_data_arg_ids.update(_allowed_feature_symbols_data_ids(fn))
+    allowed_data_arg_ids = _allowed_feature_symbols_data_ids(fn)
+    for candidate_call in ast.walk(fn):
+        if isinstance(candidate_call, ast.Call) and _call_name(candidate_call.func) in {
+            "evaluate_expression",
+            "evaluate_equation_system",
+        }:
+            allowed_data_arg_ids.update(_validate_evaluate_expression_data_args(candidate_call))
     _validate_no_dataset_data_leak(fn, allowed_data_arg_ids)
 
     evaluate_calls = 0
@@ -421,19 +441,20 @@ def validate_candidate_source(program_path: str) -> None:
                 )
         if isinstance(node, ast.Call):
             name = _call_name(node.func)
-            if name == "evaluate_expression":
+            if name in {"evaluate_expression", "evaluate_equation_system"}:
                 evaluate_calls += 1
             if name not in _ALLOWED_EVALUATE_CALLS:
                 raise ValueError(
                     f"{SINGLE_EQUATION_ERROR_PREFIX}: call '{name or type(node.func).__name__}' "
                     "is not allowed inside evaluate_symbolic_candidate(). Allowed calls "
-                    "are the symbol helpers, evaluate_expression, and basic sp.* math."
+                    "are equation constructors, symbol helpers, one scorer, and "
+                    "basic sp.* math."
                 )
 
     if evaluate_calls != 1:
         raise ValueError(
             f"{SINGLE_EQUATION_ERROR_PREFIX}: evaluate_symbolic_candidate() must call "
-            f"evaluate_expression() exactly once; found {evaluate_calls} calls."
+            f"one scorer exactly once; found {evaluate_calls} calls."
         )
 
 
@@ -598,9 +619,7 @@ def _trajectory_preserving_split(
         return X, empty_X, y, empty_y
 
     shuffled = rng.permutation(len(curves))
-    n_val_curves = min(
-        max(1, int(round(len(curves) * TEST_SIZE))), len(curves) - 1
-    )
+    n_val_curves = min(max(1, int(round(len(curves) * TEST_SIZE))), len(curves) - 1)
     val_curve_ids = set(int(i) for i in shuffled[:n_val_curves])
 
     fit_indices: list[int] = []
@@ -686,9 +705,7 @@ def load_all_datasets(
 NUM_WORKERS = int(os.environ.get("SKYDISCOVER_EVAL_WORKERS", min(8, os.cpu_count() or 4)))
 SHAPE_LOSS_WEIGHT = float(os.environ.get("SKYDISCOVER_SHAPE_LOSS_WEIGHT", "0.25"))
 SHAPE_LOSS_WEIGHT = min(max(SHAPE_LOSS_WEIGHT, 0.0), 1.0)
-SHAPE_FIT_WEIGHT = float(
-    os.environ.get("SKYDISCOVER_SHAPE_FIT_WEIGHT", str(SHAPE_LOSS_WEIGHT))
-)
+SHAPE_FIT_WEIGHT = float(os.environ.get("SKYDISCOVER_SHAPE_FIT_WEIGHT", str(SHAPE_LOSS_WEIGHT)))
 SHAPE_FIT_WEIGHT = min(max(SHAPE_FIT_WEIGHT, 0.0), 1.0 - 1e-6)
 
 
@@ -782,9 +799,7 @@ def _soft_l1_point_residuals(residuals: np.ndarray) -> np.ndarray:
     """
     residuals = np.asarray(residuals, dtype=float)
     squared = residuals**2
-    magnitude = np.abs(residuals) * np.sqrt(
-        2.0 / (np.sqrt(1.0 + squared) + 1.0)
-    )
+    magnitude = np.abs(residuals) * np.sqrt(2.0 / (np.sqrt(1.0 + squared) + 1.0))
     return np.copysign(magnitude, residuals)
 
 
@@ -819,11 +834,7 @@ def _relative_response_levels(y_true: np.ndarray) -> tuple[float, ...]:
     baseline = float(np.median(y_true[:window]))
     plateau = float(np.median(y_true[-window:]))
     amplitude = plateau - baseline
-    return tuple(
-        baseline + level * amplitude
-        for level in SHAPE_TIMING_LEVELS
-        if 0.0 < level < 1.0
-    )
+    return tuple(baseline + level * amplitude for level in SHAPE_TIMING_LEVELS if 0.0 < level < 1.0)
 
 
 def _curve_shape_components(
@@ -878,9 +889,7 @@ def _curve_shape_components(
             elif true_crossing is None or pred_crossing is None:
                 timing_losses.append(1.0)
             else:
-                timing_losses.append(
-                    min(abs(float(pred_crossing) - float(true_crossing)), 1.0)
-                )
+                timing_losses.append(min(abs(float(pred_crossing) - float(true_crossing)), 1.0))
         components.append((slope_loss, tuple(timing_losses)))
     return components
 
@@ -911,8 +920,7 @@ def _curve_shape_fit_residuals(
         if timing_losses:
             timing_scale = 0.5 * common_scale / len(timing_losses)
             residuals.extend(
-                np.sqrt(max(timing_loss, 0.0) * timing_scale)
-                for timing_loss in timing_losses
+                np.sqrt(max(timing_loss, 0.0) * timing_scale) for timing_loss in timing_losses
             )
     return np.asarray(residuals, dtype=float)
 
@@ -923,8 +931,7 @@ def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> 
         return 1.0
 
     curve_losses = [
-        0.5 * slope_loss
-        + 0.5 * (float(np.mean(timing_losses)) if timing_losses else 0.0)
+        0.5 * slope_loss + 0.5 * (float(np.mean(timing_losses)) if timing_losses else 0.0)
         for slope_loss, timing_losses in _curve_shape_components(X, y_true, y_pred)
     ]
 
@@ -933,8 +940,7 @@ def _curve_shape_loss(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> 
     mean_loss = float(np.mean(curve_losses))
     worst_curve_loss = float(np.quantile(curve_losses, 0.9))
     return float(
-        (1.0 - SHAPE_WORST_CURVE_WEIGHT) * mean_loss
-        + SHAPE_WORST_CURVE_WEIGHT * worst_curve_loss
+        (1.0 - SHAPE_WORST_CURVE_WEIGHT) * mean_loss + SHAPE_WORST_CURVE_WEIGHT * worst_curve_loss
     )
 
 
@@ -1035,7 +1041,6 @@ def evaluate_ode_expression(
     n_features = X_fit.shape[1] if X_fit.shape[0] else X_val.shape[1]
     feature_names = [f"x{i}" for i in range(n_features)]
     template = equation_session._as_sympy_expr(expression, feature_names)
-    equation_session._record_scored_template(template)
 
     if constants is None:
         feature_set = set(equation_session.feature_symbols(n_features))
@@ -1059,18 +1064,14 @@ def evaluate_ode_expression(
         nmse_train = (
             float("nan")
             if evaluation_only
-            else _nmse_with_gaussian_smoothed_target(
-                y_train, y_pred_fit, X_train, y_reference
-            )
+            else _nmse_with_gaussian_smoothed_target(y_train, y_pred_fit, X_train, y_reference)
         )
         nmse_val = (
             float("nan")
             if train_only
             else _nmse_with_gaussian_smoothed_target(y_val, y_pred_val, X_val, y_reference)
         )
-        shape_loss_val = (
-            float("nan") if train_only else _curve_shape_loss(X_val, y_val, y_pred_val)
-        )
+        shape_loss_val = float("nan") if train_only else _curve_shape_loss(X_val, y_val, y_pred_val)
         scored_loss_val = (
             float("nan") if train_only else _composite_scored_loss(nmse_val, shape_loss_val)
         )
@@ -1098,7 +1099,6 @@ def evaluate_ode_expression(
                 else combined_score_from_nmse(scored_loss_val)
             ),
         }
-        equation_session._record_scorer_result(result)
         return result
 
     fit_reference = y_train if y_train.size else y_fit
@@ -1175,9 +1175,7 @@ def evaluate_ode_expression(
     if best_fit is None:
         raise RuntimeError("constant fitting did not produce a result")
 
-    fitted_constants = {
-        str(symbol): float(value) for symbol, value in zip(constants, best_fit.x)
-    }
+    fitted_constants = {str(symbol): float(value) for symbol, value in zip(constants, best_fit.x)}
     substitutions = dict(zip(constants, best_fit.x))
     fitted_expr = template.subs(substitutions)
     y_pred_fit = _ode_predictions(rhs_fn, X_fit, y_fit, best_fit.x)
@@ -1185,18 +1183,14 @@ def evaluate_ode_expression(
     nmse_train = (
         float("nan")
         if evaluation_only
-        else _nmse_with_gaussian_smoothed_target(
-            y_train, y_pred_fit, X_train, y_reference
-        )
+        else _nmse_with_gaussian_smoothed_target(y_train, y_pred_fit, X_train, y_reference)
     )
     nmse_val = (
         float("nan")
         if train_only
         else _nmse_with_gaussian_smoothed_target(y_val, y_pred_val, X_val, y_reference)
     )
-    shape_loss_val = (
-        float("nan") if train_only else _curve_shape_loss(X_val, y_val, y_pred_val)
-    )
+    shape_loss_val = float("nan") if train_only else _curve_shape_loss(X_val, y_val, y_pred_val)
     scored_loss_val = (
         float("nan") if train_only else _composite_scored_loss(nmse_val, shape_loss_val)
     )
@@ -1226,7 +1220,6 @@ def evaluate_ode_expression(
             else combined_score_from_nmse(scored_loss_val)
         ),
     }
-    equation_session._record_scorer_result(result)
     return result
 
 
@@ -1248,7 +1241,9 @@ def _point_weighted_mean(
     return float(weighted / total_weight)
 
 
-def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _aggregate_per_dataset_results(
+    per_dataset_results: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
     """Aggregate per-dataset metrics without letting failed datasets disappear."""
     scoring_results = {
         name: result
@@ -1260,9 +1255,7 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
     scored_loss_vals = [
         float(r.get("scored_loss_val", r["nmse_val"])) for r in scoring_results.values()
     ]
-    shape_loss_vals = [
-        float(r.get("shape_loss_val", 0.0)) for r in scoring_results.values()
-    ]
+    shape_loss_vals = [float(r.get("shape_loss_val", 0.0)) for r in scoring_results.values()]
     train_nmse_vals = [
         float(r["nmse_train"])
         for r in per_dataset_results.values()
@@ -1287,6 +1280,18 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
             if r.get("combined_score", 0.0) > 0 and r.get("equation_template")
         }
     )
+    system_fingerprints = sorted(
+        {
+            str(r.get("system_fingerprint"))
+            for r in per_dataset_results.values()
+            if r.get("system_fingerprint")
+        }
+    )
+    metadata_source = next(
+        (result for result in per_dataset_results.values() if result.get("system_fingerprint")),
+        {},
+    )
+    structural_penalty = float(metadata_source.get("structural_penalty", 0.0))
 
     eq_template = ""
     for r in per_dataset_results.values():
@@ -1332,6 +1337,11 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
             "The base equation must be identical for all datasets; only fitted "
             f"constants may vary. Example templates: {examples}"
         )
+    elif len(system_fingerprints) > 1:
+        violation_error = (
+            "Single-equation violation: evaluate_symbolic_candidate() produced "
+            "different ordered equation systems across datasets."
+        )
 
     if violation_error:
         agg_nmse = float("inf")
@@ -1349,9 +1359,7 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         mean_scored_loss_eval_only = float("inf")
         mean_shape_loss_eval_only = float("inf")
     else:
-        val_point_weights = [
-            int(r.get("n_val_points", 0)) for r in scoring_results.values()
-        ]
+        val_point_weights = [int(r.get("n_val_points", 0)) for r in scoring_results.values()]
         mean_nmse = _point_weighted_mean(nmse_vals, val_point_weights)
         raw_mean_nmse = _point_weighted_mean(raw_nmse_vals, val_point_weights)
         mean_scored_loss = _point_weighted_mean(scored_loss_vals, val_point_weights)
@@ -1374,7 +1382,9 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         eval_only_scored_loss_vals = [
             float(result.get("scored_loss_val", result["nmse_val"]))
             for result in eval_only_results.values()
-            if np.isfinite(float(result.get("scored_loss_val", result.get("nmse_val", float("inf")))))
+            if np.isfinite(
+                float(result.get("scored_loss_val", result.get("nmse_val", float("inf"))))
+            )
         ]
         eval_only_shape_loss_vals = [
             float(result.get("shape_loss_val", 0.0))
@@ -1394,7 +1404,9 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         heldout_scored_loss_vals = [
             float(result.get("scored_loss_val", result["nmse_val"]))
             for result in heldout_curve_results.values()
-            if np.isfinite(float(result.get("scored_loss_val", result.get("nmse_val", float("inf")))))
+            if np.isfinite(
+                float(result.get("scored_loss_val", result.get("nmse_val", float("inf"))))
+            )
         ]
         heldout_shape_loss_vals = [
             float(result.get("shape_loss_val", 0.0))
@@ -1440,11 +1452,9 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         agg_scored_loss = mean_scored_loss
         agg_train_nmse = float(np.mean(train_nmse_vals)) if train_nmse_vals else float("inf")
         raw_combined = (
-            float(1.0 / (1.0 + max(agg_scored_loss, 0.0)))
-            if np.isfinite(agg_scored_loss)
-            else 0.0
+            float(1.0 / (1.0 + max(agg_scored_loss, 0.0))) if np.isfinite(agg_scored_loss) else 0.0
         )
-        agg_combined = raw_combined
+        agg_combined = raw_combined * max(0.0, 1.0 - structural_penalty)
         n_successful = sum(1 for value in nmse_vals if np.isfinite(value))
 
     validation_semantics_feedback = (
@@ -1478,6 +1488,15 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         ),
         "combined_score": agg_combined,
         "fit_score": raw_combined if not violation_error else 0.0,
+        "raw_combined_score": raw_combined if not violation_error else 0.0,
+        "equation_count": int(metadata_source.get("equation_count", 1)),
+        "equation_templates": metadata_source.get("equation_templates", []),
+        "resolved_ode_template": str(metadata_source.get("resolved_ode_template", "")),
+        "system_fingerprint": str(metadata_source.get("system_fingerprint", "")),
+        "total_tree_complexity": float(
+            metadata_source.get("total_tree_complexity", metadata_source.get("complexity", 0.0))
+        ),
+        "structural_penalty": structural_penalty,
         "n_datasets": len(scoring_results),
         "n_total_datasets": len(per_dataset_results),
         "n_train_only_datasets": len(per_dataset_results) - len(scoring_results),
@@ -1485,9 +1504,7 @@ def _aggregate_per_dataset_results(per_dataset_results: dict[str, dict[str, Any]
         "n_evaluation_only_datasets": len(
             [name for name, result in per_dataset_results.items() if result.get("evaluation_only")]
         ),
-        "mean_nmse_eval_only": (
-            mean_nmse_eval_only if not violation_error else float("inf")
-        ),
+        "mean_nmse_eval_only": (mean_nmse_eval_only if not violation_error else float("inf")),
         "eval_workers": NUM_WORKERS,
         "hard_cases": hard_cases,
         "hard_case_feedback": hard_case_feedback,
@@ -1548,7 +1565,7 @@ try:
     evaluator.validate_candidate_source(program_path)
 
     import pysr_harness.equation_session as equation_session
-    equation_session.evaluate_expression = evaluator.evaluate_ode_expression
+    equation_session._expression_scorer = evaluator.evaluate_ode_expression
     equation_session.nmse = evaluator._nmse_with_gaussian_smoothed_target
     spec = importlib.util.spec_from_file_location("program", program_path)
     program = importlib.util.module_from_spec(spec)
@@ -1586,6 +1603,13 @@ try:
                 "equation": str(result.get("equation", "")),
                 "equation_template": str(result.get("equation_template", "")),
                 "constants": result.get("constants", {{}}),
+                "equation_count": int(result.get("equation_count", 1)),
+                "equation_templates": result.get("equation_templates", []),
+                "resolved_ode_template": str(result.get("resolved_ode_template", "")),
+                "system_fingerprint": str(result.get("system_fingerprint", "")),
+                "total_tree_complexity": float(result.get("total_tree_complexity", 0.0)),
+                "structural_penalty": float(result.get("structural_penalty", 0.0)),
+                "raw_combined_score": float(result.get("raw_combined_score", ds_combined)),
             }}
         except Exception as exc:
             return ds_name, {{
@@ -1667,26 +1691,27 @@ def _metrics_from_result(result: dict, eval_time: float) -> dict:
         "shape_loss_val": float(result.get("shape_loss_val", 0.0)),
         "shape_loss_weight": float(result.get("shape_loss_weight", SHAPE_LOSS_WEIGHT)),
         "heldout_curve_nmse": float(result.get("heldout_curve_nmse", float("nan"))),
-        "heldout_curve_scored_loss": float(
-            result.get("heldout_curve_scored_loss", float("nan"))
-        ),
-        "heldout_curve_shape_loss": float(
-            result.get("heldout_curve_shape_loss", float("nan"))
-        ),
+        "heldout_curve_scored_loss": float(result.get("heldout_curve_scored_loss", float("nan"))),
+        "heldout_curve_shape_loss": float(result.get("heldout_curve_shape_loss", float("nan"))),
         "eval_only_nmse": float(result.get("eval_only_nmse", float("nan"))),
         "eval_only_scored_loss": float(result.get("eval_only_scored_loss", float("nan"))),
         "eval_only_shape_loss": float(result.get("eval_only_shape_loss", float("nan"))),
         "combined_score": combined,
         "fit_score": float(result.get("fit_score", combined)),
+        "raw_combined_score": float(result.get("raw_combined_score", combined)),
+        "equation_count": int(result.get("equation_count", 1)),
+        "equation_templates": result.get("equation_templates", []),
+        "resolved_ode_template": str(result.get("resolved_ode_template", "")),
+        "system_fingerprint": str(result.get("system_fingerprint", "")),
+        "total_tree_complexity": float(result.get("total_tree_complexity", 0.0)),
+        "structural_penalty": float(result.get("structural_penalty", 0.0)),
         "eval_time": float(eval_time),
         "n_datasets": result.get("n_datasets", 0),
         "n_successful": result.get("n_successful", 0),
         "eval_workers": result.get("eval_workers", NUM_WORKERS),
         "hard_cases": result.get("hard_cases", []),
         "hard_case_feedback": str(result.get("hard_case_feedback", "")),
-        "validation_semantics_feedback": str(
-            result.get("validation_semantics_feedback", "")
-        ),
+        "validation_semantics_feedback": str(result.get("validation_semantics_feedback", "")),
         "per_dataset": result.get("per_dataset", {}),
         "error": str(result.get("error", "")),
     }
@@ -1760,7 +1785,8 @@ def _eval_stage1_worker(args):
         sys.path.insert(0, harness_root)
     validate_candidate_source(program_path)
     import pysr_harness.equation_session as equation_session
-    equation_session.evaluate_expression = evaluate_ode_expression
+
+    equation_session._expression_scorer = evaluate_ode_expression
     equation_session.nmse = _nmse_with_gaussian_smoothed_target
     spec = importlib.util.spec_from_file_location("program", program_path)
     program = importlib.util.module_from_spec(spec)
@@ -1779,8 +1805,15 @@ def _eval_stage1_worker(args):
         with single_equation_evaluation():
             result = fn(X_train, y_train, X_val, y_val)
             validate_single_equation_result(result)
-        return float(result.get("combined_score", 0.0)), None, str(
-            result.get("equation_template", "")
+        return (
+            float(result.get("combined_score", 0.0)),
+            None,
+            str(
+                result.get(
+                    "system_fingerprint",
+                    result.get("equation_template", ""),
+                )
+            ),
         )
     except Exception as exc:
         return 0.0, str(exc), ""
@@ -1813,7 +1846,9 @@ def evaluate_stage1(program_path: str) -> dict:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
             futures = [executor.submit(_eval_stage1_worker, item) for item in work_items]
-            worker_results = [future.result() for future in concurrent.futures.as_completed(futures)]
+            worker_results = [
+                future.result() for future in concurrent.futures.as_completed(futures)
+            ]
 
         combined_scores = [score for score, _error, _template in worker_results]
         successful_scores = [score for score in combined_scores if score > 0]
@@ -1845,11 +1880,7 @@ def evaluate_stage1(program_path: str) -> dict:
                 ),
             }
         templates = sorted(
-            {
-                template
-                for score, _error, template in worker_results
-                if score > 0 and template
-            }
+            {template for score, _error, template in worker_results if score > 0 and template}
         )
         if len(templates) > 1:
             examples = "; ".join(templates[:3])

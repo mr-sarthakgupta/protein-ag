@@ -73,7 +73,7 @@ export BEDROCK_READ_TIMEOUT="${BEDROCK_READ_TIMEOUT:-1800}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCHMARK_DIR="benchmarks/pysr_symbolic/disease_relevant_inhibited_all_normalized_ode"
 BENCHMARK_ROOT="$SCRIPT_DIR/benchmarks/pysr_symbolic"
-SKYDISCOVER_SEED_CHECKPOINT="${SKYDISCOVER_SEED_CHECKPOINT:-$SCRIPT_DIR/outputs_diff_inhibited_norm/$SEARCH/seed_checkpoints/disease_relevant_inhibited_all_normalized_ode_nfev${SKYDISCOVER_INHIBITED_MAX_NFEV}_curve${SKYDISCOVER_ODE_CURVE_WORKERS}_multistart${SKYDISCOVER_ODE_MULTISTART_WORKERS}_uninhibited${SKYDISCOVER_INCLUDE_UNINHIBITED}}"
+SKYDISCOVER_SEED_CHECKPOINT="${SKYDISCOVER_SEED_CHECKPOINT:-$SCRIPT_DIR/outputs_diff_inhibited_norm/$SEARCH/seed_checkpoints/disease_relevant_inhibited_all_normalized_ode_equation_system_v2_nfev${SKYDISCOVER_INHIBITED_MAX_NFEV}_curve${SKYDISCOVER_ODE_CURVE_WORKERS}_multistart${SKYDISCOVER_ODE_MULTISTART_WORKERS}_uninhibited${SKYDISCOVER_INCLUDE_UNINHIBITED}}"
 export SKYDISCOVER_SEED_CHECKPOINT
 
 # ── Preflight checks ────────────────────────────────────────────────
@@ -151,7 +151,7 @@ evaluator = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evaluator)
 
 import pysr_harness.equation_session as equation_session
-equation_session.evaluate_expression = evaluator.evaluate_ode_expression
+equation_session._expression_scorer = evaluator.evaluate_ode_expression
 equation_session.nmse = evaluator._nmse_with_gaussian_smoothed_target
 from pysr_harness.equation_session import (
     single_equation_evaluation,

@@ -9,9 +9,11 @@ import sympy as sp
 from numpy.typing import NDArray
 
 from pysr_harness.equation_session import (
+    algebraic_equation,
     constant_symbols,
-    evaluate_expression,
+    evaluate_equation_system,
     feature_symbols,
+    ode_equation,
 )
 
 
@@ -37,21 +39,33 @@ def evaluate_symbolic_candidate(
     inhibitor = x[3]
     concentration = x[4]
 
-    inhibitor_scale = 1 + c[5] ** 2 * inhibitor + c[6] ** 2 * inhibitor * monomer
-    source_rate = (c[0] ** 2 * monomer ** c[1] + c[2] ** 2 * seed) / inhibitor_scale
-    autocatalytic_rate = (
-        c[3] ** 2 * monomer ** c[4] * (1 + c[7] ** 2 * seed) / inhibitor_scale
-    )
-    baseline_flux = c[8] ** 2
-    plateau = c[9]
-    capacity = plateau - concentration
+    inhibitor_scale = sp.Symbol("inhibitor_scale")
+    source_rate = sp.Symbol("source_rate")
+    autocatalytic_rate = sp.Symbol("autocatalytic_rate")
+    capacity = sp.Symbol("capacity")
+    equations = [
+        algebraic_equation(
+            inhibitor_scale,
+            1 + c[5] ** 2 * inhibitor + c[6] ** 2 * inhibitor * monomer,
+        ),
+        algebraic_equation(
+            source_rate,
+            c[0] ** 2 * monomer ** c[1] + c[2] ** 2 * seed,
+        ),
+        algebraic_equation(
+            autocatalytic_rate,
+            c[3] ** 2 * monomer ** c[4] * (1 + c[7] ** 2 * seed),
+        ),
+        algebraic_equation(capacity, c[9] - concentration),
+        ode_equation(
+            capacity
+            * (c[8] ** 2 + (source_rate + autocatalytic_rate * concentration) / inhibitor_scale)
+            + c[10] * time * capacity
+        ),
+    ]
 
-    expression = capacity * (
-        baseline_flux + source_rate + autocatalytic_rate * concentration
-    ) + c[10] * time * capacity
-
-    return evaluate_expression(
-        expression,
+    return evaluate_equation_system(
+        equations,
         X_train,
         y_train,
         X_val,

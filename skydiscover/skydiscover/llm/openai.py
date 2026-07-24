@@ -33,6 +33,7 @@ REASONING_MODEL_PREFIXES = (
 )
 
 GOOGLE_AI_STUDIO_DOMAIN = "generativelanguage.googleapis.com"
+BEDROCK_MANTLE_DOMAIN = "bedrock-mantle.us-east-1.api.aws"
 
 _OPENAI_API_PREFIXES = (
     "https://api.openai.com",
@@ -41,14 +42,26 @@ _OPENAI_API_PREFIXES = (
 )
 
 
+def is_bedrock_mantle_api(api_base: str) -> bool:
+    """Return whether *api_base* targets Bedrock Mantle's OpenAI endpoint."""
+    try:
+        return (urlparse(api_base).hostname or "").lower() == BEDROCK_MANTLE_DOMAIN
+    except (TypeError, ValueError):
+        return False
+
+
 def is_openai_reasoning_model(model_name: str, api_base: str) -> bool:
     """Check if a model is an OpenAI reasoning model requiring special parameters."""
     api_base_lower = (api_base or "").lower()
     is_openai_api = (
         any(api_base_lower.startswith(p) for p in _OPENAI_API_PREFIXES)
         or ".openai.azure.com" in api_base_lower
+        or is_bedrock_mantle_api(api_base)
     )
-    return is_openai_api and model_name.lower().startswith(REASONING_MODEL_PREFIXES)
+    normalized_name = (model_name or "").lower()
+    if normalized_name.startswith("openai."):
+        normalized_name = normalized_name.removeprefix("openai.")
+    return is_openai_api and normalized_name.startswith(REASONING_MODEL_PREFIXES)
 
 
 class OpenAILLM(LLMInterface):
@@ -65,6 +78,17 @@ class OpenAILLM(LLMInterface):
         self.api_base = model_cfg.api_base
         self.api_key = model_cfg.api_key
         self.reasoning_effort = getattr(model_cfg, "reasoning_effort", None)
+        self._use_responses_api = is_bedrock_mantle_api(self.api_base)
+
+        if self._use_responses_api and not self.api_key:
+            from skydiscover.llm.bedrock_auth import resolve_bedrock_bearer_token
+
+            self.api_key = resolve_bedrock_bearer_token()
+            if not self.api_key:
+                raise ValueError(
+                    "Bedrock Mantle requires AWS_BEARER_TOKEN_BEDROCK or an ABSK "
+                    "aws_session_token in the selected AWS credentials profile"
+                )
 
         max_retries = self.retries if self.retries is not None else 0
         is_azure = self.api_base and ".openai.azure.com" in self.api_base.lower()
@@ -104,6 +128,8 @@ class OpenAILLM(LLMInterface):
                 provider = "DeepSeek"
             elif "api.mistral.ai" in api_base_str:
                 provider = "Mistral"
+            elif is_bedrock_mantle_api(self.api_base):
+                provider = "AWS Bedrock Mantle"
             else:
                 provider = "OpenAI"
             logger.info(f"{provider} LLM: {self.model}")
@@ -162,7 +188,12 @@ class OpenAILLM(LLMInterface):
 
         for attempt in range(retries + 1):
             try:
-                return await asyncio.wait_for(self._call_api(params), timeout=timeout)
+                call = (
+                    self._call_api_via_responses(params)
+                    if self._use_responses_api
+                    else self._call_api(params)
+                )
+                return await asyncio.wait_for(call, timeout=timeout)
             except asyncio.TimeoutError:
                 if attempt < retries:
                     logger.warning(f"Timeout attempt {attempt + 1}/{retries + 1}, retrying...")
@@ -218,6 +249,8 @@ class OpenAILLM(LLMInterface):
             resp_params["temperature"] = params["temperature"]
         if params.get("reasoning_effort") is not None:
             resp_params["reasoning"] = {"effort": params["reasoning_effort"]}
+        if params.get("verbosity") is not None:
+            resp_params["text"] = {"verbosity": params["verbosity"]}
 
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(

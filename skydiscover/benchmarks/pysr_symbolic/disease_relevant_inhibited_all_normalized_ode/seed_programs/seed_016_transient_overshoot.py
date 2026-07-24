@@ -9,9 +9,11 @@ import sympy as sp
 from numpy.typing import NDArray
 
 from pysr_harness.equation_session import (
+    algebraic_equation,
     constant_symbols,
-    evaluate_expression,
+    evaluate_equation_system,
     feature_symbols,
+    ode_equation,
 )
 
 
@@ -31,14 +33,33 @@ def evaluate_symbolic_candidate(
     inhibitor = x[3]
     concentration = x[4]
 
-    rise = c[0] ** 2 * time * sp.exp(-c[1] ** 2 * time)
-    delayed_removal = c[2] ** 2 * time ** 2 / (1 + c[3] ** 2 * time ** 2)
+    rise = sp.Symbol("rise")
+    delayed_removal = sp.Symbol("delayed_removal")
     source = c[4] ** 2 * monomer + c[5] ** 2 * seed
-    inhibitor_gate = 1 + c[6] ** 2 * inhibitor + c[7] ** 2 * inhibitor * time
-    expression = source / inhibitor_gate + c[8] ** 2 * rise - (c[9] ** 2 + c[10] ** 2 * delayed_removal) * concentration
+    inhibitor_gate = sp.Symbol("inhibitor_gate")
+    expression = (
+        source / inhibitor_gate
+        + c[8] ** 2 * rise
+        - (c[9] ** 2 + c[10] ** 2 * delayed_removal) * concentration
+    )
+    equations = [
+        algebraic_equation(
+            rise,
+            c[0] ** 2 * time * sp.exp(-c[1] ** 2 * time),
+        ),
+        algebraic_equation(
+            delayed_removal,
+            c[2] ** 2 * time**2 / (1 + c[3] ** 2 * time**2),
+        ),
+        algebraic_equation(
+            inhibitor_gate,
+            1 + c[6] ** 2 * inhibitor + c[7] ** 2 * inhibitor * time,
+        ),
+        ode_equation(expression),
+    ]
 
-    return evaluate_expression(
-        expression,
+    return evaluate_equation_system(
+        equations,
         X_train,
         y_train,
         X_val,

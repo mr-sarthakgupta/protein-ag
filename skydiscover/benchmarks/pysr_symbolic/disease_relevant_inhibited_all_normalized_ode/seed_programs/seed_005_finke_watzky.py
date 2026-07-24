@@ -9,9 +9,11 @@ import sympy as sp
 from numpy.typing import NDArray
 
 from pysr_harness.equation_session import (
+    algebraic_equation,
     constant_symbols,
-    evaluate_expression,
+    evaluate_equation_system,
     feature_symbols,
+    ode_equation,
 )
 
 
@@ -31,15 +33,25 @@ def evaluate_symbolic_candidate(
     inhibitor = x[3]
     concentration = x[4]
 
-    free_monomer = monomer / (1 + c[0] ** 2 * inhibitor)
+    free_monomer = sp.Symbol("free_monomer")
     nucleation = c[1] ** 2 * free_monomer + c[2] ** 2 * seed
     autocatalysis = c[3] ** 2 * free_monomer * concentration
     available = c[4] / (1 + c[5] ** 2 * inhibitor) - concentration
-    surface_block = 1 + c[6] ** 2 * inhibitor * concentration + c[7] ** 2 * concentration ** 2
-    expression = available * (nucleation + autocatalysis / surface_block) - c[8] ** 2 * inhibitor * concentration
+    surface_block = 1 + c[6] ** 2 * inhibitor * concentration + c[7] ** 2 * concentration**2
+    expression = (
+        available * (nucleation + autocatalysis / surface_block)
+        - c[8] ** 2 * inhibitor * concentration
+    )
+    equations = [
+        algebraic_equation(
+            free_monomer,
+            monomer / (1 + c[0] ** 2 * inhibitor),
+        ),
+        ode_equation(expression),
+    ]
 
-    return evaluate_expression(
-        expression,
+    return evaluate_equation_system(
+        equations,
         X_train,
         y_train,
         X_val,

@@ -9,9 +9,11 @@ import sympy as sp
 from numpy.typing import NDArray
 
 from pysr_harness.equation_session import (
+    algebraic_equation,
     constant_symbols,
-    evaluate_expression,
+    evaluate_equation_system,
     feature_symbols,
+    ode_equation,
 )
 
 
@@ -31,14 +33,27 @@ def evaluate_symbolic_candidate(
     inhibitor = x[3]
     concentration = x[4]
 
-    primary = (c[0] ** 2 * monomer + c[1] ** 2) / (1 + c[2] ** 2 * inhibitor)
+    primary = sp.Symbol("primary")
     seeded = c[3] ** 2 * seed / (1 + c[4] ** 2 * inhibitor * seed)
-    secondary = c[5] ** 2 * monomer * concentration / (1 + c[6] ** 2 * inhibitor * concentration)
-    fragmentation = c[7] ** 2 * concentration ** 2 / (1 + c[8] ** 2 * inhibitor)
-    expression = (c[9] - concentration) * (primary + seeded + secondary + fragmentation) - c[10] ** 2 * inhibitor * concentration
+    secondary = sp.Symbol("secondary")
+    fragmentation = c[7] ** 2 * concentration**2 / (1 + c[8] ** 2 * inhibitor)
+    expression = (c[9] - concentration) * (primary + seeded + secondary + fragmentation) - c[
+        10
+    ] ** 2 * inhibitor * concentration
+    equations = [
+        algebraic_equation(
+            primary,
+            (c[0] ** 2 * monomer + c[1] ** 2) / (1 + c[2] ** 2 * inhibitor),
+        ),
+        algebraic_equation(
+            secondary,
+            c[5] ** 2 * monomer * concentration / (1 + c[6] ** 2 * inhibitor * concentration),
+        ),
+        ode_equation(expression),
+    ]
 
-    return evaluate_expression(
-        expression,
+    return evaluate_equation_system(
+        equations,
         X_train,
         y_train,
         X_val,

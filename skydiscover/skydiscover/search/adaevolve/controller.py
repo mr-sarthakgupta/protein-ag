@@ -27,6 +27,10 @@ from skydiscover.context_builder.adaevolve import AdaEvolveContextBuilder
 from skydiscover.context_builder.default import DefaultContextBuilder
 from skydiscover.evaluation.llm_judge import LLMJudge
 from skydiscover.llm.llm_pool import LLMPool
+from skydiscover.search.adaevolve.explanations import (
+    IterationExplanationWriter,
+    select_iteration_programs,
+)
 from skydiscover.search.adaevolve.paradigm import ParadigmGenerator
 from skydiscover.search.base_database import Program
 from skydiscover.search.default_discovery_controller import (
@@ -77,6 +81,21 @@ class AdaEvolveController(DiscoveryController):
         # Components
         self.llms = LLMPool(self.config.llm.models)
         self.context_builder = AdaEvolveContextBuilder(self.config)
+        self.iteration_explanation_writer = None
+        explanation_config = self.config.iteration_explanations
+        if explanation_config.enabled:
+            try:
+                explanation_pool = LLMPool(explanation_config.models)
+                self.iteration_explanation_writer = IterationExplanationWriter(
+                    explanation_pool,
+                    explanation_config,
+                    self.output_dir or ".",
+                )
+                logger.info("Post-iteration explanations enabled with dedicated direct LLM pool")
+            except Exception:
+                logger.exception(
+                    "Could not initialize post-iteration explanations; search will continue"
+                )
 
         # Paradigm generator (if paradigm breakthrough is enabled)
         # Note: We check database.use_paradigm_breakthrough at runtime, not this init-time flag
@@ -166,6 +185,7 @@ class AdaEvolveController(DiscoveryController):
         eval_time: Optional[float] = None,
         error: Optional[str] = None,
         agent_results: Optional[List[SerializableResult]] = None,
+        explanation_results: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
         Log comprehensive iteration statistics to JSON file.
@@ -253,17 +273,13 @@ class AdaEvolveController(DiscoveryController):
                 stats["iteration_result"]["agent_results"] = serialized_results
                 stats["iteration_result"]["child_programs"] = child_programs
                 if child_programs and "child_program" not in stats["iteration_result"]:
-                    best_id = stats["iteration_result"].get(
-                        "current_iteration_best_program_id"
-                    )
+                    best_id = stats["iteration_result"].get("current_iteration_best_program_id")
                     stats["iteration_result"]["child_program"] = next(
-                        (
-                            program
-                            for program in child_programs
-                            if program["id"] == best_id
-                        ),
+                        (program for program in child_programs if program["id"] == best_id),
                         child_programs[0],
                     )
+            if explanation_results is not None:
+                stats["iteration_result"]["explanations"] = explanation_results
 
             # Write to JSONL file
             with open(self._iteration_stats_log_path, "a") as f:
@@ -361,6 +377,19 @@ class AdaEvolveController(DiscoveryController):
     async def _run_iteration(self, iteration: int, checkpoint_callback) -> None:
         """Generate one configurable batch of children and commit it atomically."""
         iteration_start_time = time.time()
+        explanation_writer = getattr(self, "iteration_explanation_writer", None)
+        previous_best = self.database.get_best_program() if explanation_writer else None
+        previous_best_id = previous_best.id if previous_best else None
+        previous_best_score = (
+            self.database.get_program_proxy_score(previous_best)
+            if previous_best is not None
+            else None
+        )
+        previous_pareto_ids = (
+            {program.id for program in self.database.get_pareto_front()}
+            if explanation_writer and self.database.is_multiobjective_enabled()
+            else set()
+        )
 
         # Check for global paradigm stagnation
         # Use database flag directly to stay in sync after checkpoint load
@@ -368,10 +397,7 @@ class AdaEvolveController(DiscoveryController):
             await self._generate_paradigms_if_needed()
 
         gathered_results = await asyncio.gather(
-            *(
-                self._run_normal_step(iteration)
-                for _ in range(self.parallel_agents_per_iteration)
-            ),
+            *(self._run_normal_step(iteration) for _ in range(self.parallel_agents_per_iteration)),
             return_exceptions=True,
         )
         results: List[SerializableResult] = []
@@ -401,9 +427,7 @@ class AdaEvolveController(DiscoveryController):
         successful_results = [result for result in results if not result.error]
         for agent_index, result in enumerate(results):
             if result.error:
-                logger.warning(
-                    f"Iteration {iteration}, agent {agent_index}: {result.error}"
-                )
+                logger.warning(f"Iteration {iteration}, agent {agent_index}: {result.error}")
                 continue
             self._process_result(
                 result,
@@ -416,6 +440,38 @@ class AdaEvolveController(DiscoveryController):
         iteration_time = time.time() - iteration_start_time
         if successful_results:
             self._checkpoint_iteration(iteration, checkpoint_callback)
+
+        explanation_results: List[Dict[str, Any]] = []
+        if explanation_writer and successful_results:
+            try:
+                batch_programs = [
+                    Program(**result.child_program_dict) for result in successful_results
+                ]
+                current_best = self.database.get_best_program()
+                current_pareto = (
+                    self.database.get_pareto_front()
+                    if self.database.is_multiobjective_enabled()
+                    else []
+                )
+                selected = select_iteration_programs(
+                    current_iteration_programs=batch_programs,
+                    previous_best_id=previous_best_id,
+                    previous_best_score=previous_best_score,
+                    current_best=current_best,
+                    previous_pareto_ids=previous_pareto_ids,
+                    current_pareto=current_pareto,
+                    score_key=self.database.get_program_proxy_score,
+                )
+                for program, reasons in selected:
+                    explanation_results.append(
+                        await explanation_writer.explain(program, iteration, reasons)
+                    )
+            except Exception:
+                logger.exception(
+                    "Post-iteration explanation stage failed at iteration %s; "
+                    "search results are preserved",
+                    iteration,
+                )
 
         errors = [result.error for result in results if result.error]
         batch_error = (
@@ -437,6 +493,7 @@ class AdaEvolveController(DiscoveryController):
             eval_time=sum(result.eval_time for result in results),
             error=batch_error,
             agent_results=results,
+            explanation_results=explanation_results,
         )
 
     async def _generate_paradigms_if_needed(self) -> None:

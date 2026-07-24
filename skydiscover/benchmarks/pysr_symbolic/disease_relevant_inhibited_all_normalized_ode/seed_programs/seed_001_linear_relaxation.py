@@ -10,8 +10,9 @@ from numpy.typing import NDArray
 
 from pysr_harness.equation_session import (
     constant_symbols,
-    evaluate_expression,
+    evaluate_equation_system,
     feature_symbols,
+    ode_equation,
 )
 
 
@@ -36,8 +37,10 @@ def evaluate_symbolic_candidate(
     removal = c[5] ** 2 * inhibitor * concentration / (1 + c[6] ** 2 * concentration)
     expression = rate * (equilibrium - concentration) - removal
 
-    return evaluate_expression(
-        expression,
+    equations = [ode_equation(expression)]
+
+    return evaluate_equation_system(
+        equations,
         X_train,
         y_train,
         X_val,
